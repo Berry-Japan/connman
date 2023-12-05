@@ -1319,9 +1319,9 @@ static bool sanity_check(struct ip_udp_dhcp_packet *packet, int bytes)
 static int dhcp_recv_l2_packet(struct dhcp_packet *dhcp_pkt, int fd,
 				struct sockaddr_in *dst_addr)
 {
-	int bytes;
 	struct ip_udp_dhcp_packet packet;
 	uint16_t check;
+	int bytes, tot_len;
 
 	memset(&packet, 0, sizeof(packet));
 
@@ -1329,15 +1329,17 @@ static int dhcp_recv_l2_packet(struct dhcp_packet *dhcp_pkt, int fd,
 	if (bytes < 0)
 		return -1;
 
-	if (bytes < (int) (sizeof(packet.ip) + sizeof(packet.udp)))
-		return -1;
-
-	if (bytes < ntohs(packet.ip.tot_len))
+	tot_len = ntohs(packet.ip.tot_len);
+	if (bytes > tot_len) {
+		/* ignore any extra garbage bytes */
+		bytes = tot_len;
+	} else if (bytes < tot_len) {
 		/* packet is bigger than sizeof(packet), we did partial read */
 		return -1;
+	}
 
-	/* ignore any extra garbage bytes */
-	bytes = ntohs(packet.ip.tot_len);
+	if (bytes < (int) (sizeof(packet.ip) + sizeof(packet.udp)))
+		return -1;
 
 	if (!sanity_check(&packet, bytes))
 		return -1;
@@ -3036,7 +3038,7 @@ char *g_dhcp_client_get_server_address(GDHCPClient *dhcp_client)
 	if (!dhcp_client)
 		return NULL;
 
-	return get_ip(dhcp_client->server_ip);
+	return get_ip(htonl(dhcp_client->server_ip));
 }
 
 char *g_dhcp_client_get_address(GDHCPClient *dhcp_client)

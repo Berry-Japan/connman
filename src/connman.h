@@ -126,6 +126,8 @@ int __connman_agent_request_peer_authorization(struct connman_peer *peer,
 						bool wps_requested,
 						const char *dbus_sender,
 						void *user_data);
+bool __connman_agent_is_request_pending(struct connman_service *service,
+						const char *dbus_sender);
 
 #include <connman/log.h>
 
@@ -449,7 +451,8 @@ char **__connman_timeserver_system_get();
 GSList *__connman_timeserver_add_list(GSList *server_list,
 		const char *timeserver);
 GSList *__connman_timeserver_get_all(struct connman_service *service);
-void __connman_timeserver_sync(struct connman_service *service);
+void __connman_timeserver_sync(struct connman_service *service,
+				enum connman_timeserver_sync_reason reason);
 void __connman_timeserver_conf_update(struct connman_service *service);
 
 bool __connman_timeserver_is_synced(void);
@@ -605,6 +608,7 @@ void __connman_network_set_device(struct connman_network *network,
 
 int __connman_network_connect(struct connman_network *network);
 int __connman_network_disconnect(struct connman_network *network);
+int __connman_network_forget(struct connman_network *network);
 int __connman_network_clear_ipconfig(struct connman_network *network,
 					struct connman_ipconfig *ipconfig);
 int __connman_network_enable_ipconfig(struct connman_network *network,
@@ -983,6 +987,7 @@ void __connman_dnsproxy_remove_listener(int index);
 int __connman_dnsproxy_append(int index, const char *domain, const char *server);
 int __connman_dnsproxy_remove(int index, const char *domain, const char *server);
 int __connman_dnsproxy_set_mdns(int index, bool enabled);
+void __connman_dnsproxy_set_listen_port(unsigned int port);
 
 int __connman_6to4_probe(struct connman_service *service);
 void __connman_6to4_remove(struct connman_ipconfig *ipconfig);

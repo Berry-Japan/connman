@@ -47,6 +47,7 @@ static GResolv *resolv = NULL;
 static int resolv_id = 0;
 
 static void sync_next(void);
+static void ts_set_nameservers(struct connman_service *service);
 
 static void resolv_debug(const char *str, void *data)
 {
@@ -183,6 +184,7 @@ static void sync_next(void)
 	}
 
 	__connman_ntp_stop();
+	ts_set_nameservers(ts_service);
 
 	while (ts_list) {
 		ts_current = ts_list->data;
@@ -307,7 +309,8 @@ static gboolean ts_recheck(gpointer user_data)
 		g_slist_free_full(ts, g_free);
 
 		service = connman_service_get_default();
-		__connman_timeserver_sync(service);
+		__connman_timeserver_sync(service,
+				CONNMAN_TIMESERVER_SYNC_REASON_TS_CHANGE);
 
 		return FALSE;
 	}
@@ -347,11 +350,51 @@ static void ts_recheck_enable(void)
 			NULL);
 }
 
-static void ts_reset(struct connman_service *service)
+static int ts_setup_resolv(struct connman_service *service)
+{
+	int i;
+
+	i = __connman_service_get_index(service);
+	if (i < 0)
+		return -EINVAL;
+
+	if (resolv) {
+		g_resolv_unref(resolv);
+		resolv = NULL;
+	}
+
+	resolv = g_resolv_new(i);
+	if (!resolv)
+		return -ENOMEM;
+
+	if (getenv("CONNMAN_RESOLV_DEBUG"))
+		g_resolv_set_debug(resolv, resolv_debug, "RESOLV");
+
+	return 0;
+}
+
+
+static void ts_set_nameservers(struct connman_service *service)
 {
 	char **nameservers;
 	int i;
 
+	if (resolv_id > 0)
+		g_resolv_cancel_lookup(resolv, resolv_id);
+
+	g_resolv_flush_nameservers(resolv);
+
+	nameservers = connman_service_get_nameservers(service);
+	if (nameservers) {
+		for (i = 0; nameservers[i]; i++)
+			g_resolv_add_nameserver(resolv, nameservers[i], 53, 0);
+
+		g_strfreev(nameservers);
+	}
+}
+
+static void ts_reset(struct connman_service *service)
+{
 	if (!resolv)
 		return;
 
@@ -366,20 +409,12 @@ static void ts_reset(struct connman_service *service)
 
 	ts_recheck_disable();
 
-	if (resolv_id > 0)
-		g_resolv_cancel_lookup(resolv, resolv_id);
-
-	g_resolv_flush_nameservers(resolv);
-
-	nameservers = connman_service_get_nameservers(service);
-	if (nameservers) {
-		for (i = 0; nameservers[i]; i++)
-			g_resolv_add_nameserver(resolv, nameservers[i], 53, 0);
-
-		g_strfreev(nameservers);
-	}
+	ts_set_nameservers(service);
 
 	g_slist_free_full(timeservers_list, g_free);
+
+	g_slist_free_full(ts_list, g_free);
+	ts_list = NULL;
 
 	timeservers_list = __connman_timeserver_get_all(service);
 
@@ -396,10 +431,26 @@ static void ts_reset(struct connman_service *service)
 	timeserver_sync_start();
 }
 
-void __connman_timeserver_sync(struct connman_service *service)
+void __connman_timeserver_sync(struct connman_service *service,
+			enum connman_timeserver_sync_reason reason)
 {
-	if (!service || ts_service == service)
+	if (!service)
 		return;
+
+	switch (reason) {
+	case CONNMAN_TIMESERVER_SYNC_REASON_START:
+	case CONNMAN_TIMESERVER_SYNC_REASON_STATE_UPDATE:
+		if (ts_service == service)
+			return;
+		break;
+	case CONNMAN_TIMESERVER_SYNC_REASON_ADDRESS_UPDATE:
+	case CONNMAN_TIMESERVER_SYNC_REASON_TS_CHANGE:
+		if (ts_service != service)
+			return;
+		break;
+	default:
+		return;
+	}
 
 	ts_reset(service);
 }
@@ -434,44 +485,19 @@ void __connman_timeserver_set_synced(bool status)
 
 static int timeserver_start(struct connman_service *service)
 {
-	char **nameservers;
-	int i;
+	int rv;
 
 	DBG("service %p", service);
 
-	i = __connman_service_get_index(service);
-	if (i < 0)
-		return -EINVAL;
-
-	nameservers = connman_service_get_nameservers(service);
-
-	/* Stop an already ongoing resolution, if there is one */
-	if (resolv && resolv_id > 0)
-		g_resolv_cancel_lookup(resolv, resolv_id);
-
 	/* get rid of the old resolver */
-	if (resolv) {
-		g_resolv_unref(resolv);
-		resolv = NULL;
-	}
+	rv = ts_setup_resolv(service);
+	if (rv)
+		return rv;
 
-	resolv = g_resolv_new(i);
-	if (!resolv) {
-		g_strfreev(nameservers);
-		return -ENOMEM;
-	}
+	ts_set_nameservers(service);
 
-	if (getenv("CONNMAN_RESOLV_DEBUG"))
-		g_resolv_set_debug(resolv, resolv_debug, "RESOLV");
-
-	if (nameservers) {
-		for (i = 0; nameservers[i]; i++)
-			g_resolv_add_nameserver(resolv, nameservers[i], 53, 0);
-
-		g_strfreev(nameservers);
-	}
-
-	__connman_timeserver_sync(service);
+	__connman_timeserver_sync(service,
+			CONNMAN_TIMESERVER_SYNC_REASON_START);
 
 	return 0;
 }

@@ -129,7 +129,8 @@ are in 'online' or 'ready' states, the newly connected service is
 the only one that will be kept connected. A service connected by the
 user will be used until going out of network coverage. With this
 setting enabled applications will notice more network breaks than
-normal. Default value is false.
+normal. Note this options can't be used with VPNs.
+Default value is false.
 .TP
 .BI TetheringTechnologies= technology\fR[,...]
 List of technologies that are allowed to enable tethering separated by ",".
@@ -205,6 +206,23 @@ address will be chosen instead (according to RFC3927). If an address conflict
 occurs for an address offered via DHCP, ConnMan send a DHCP DECLINE once and
 for the second conflict resort to finding an IPv4LL address.
 Default value is false.
+.TP
+.BI Localtime= string
+Path to localtime file. Defaults to /etc/localtime.
+.TP
+.BI RegdomFollowsTimezone= true\ \fR|\fB\ false
+Enable regdomain to be changed along timezone changes. With this option set to
+true each time the timezone changes the first present ISO3166 country code is
+being read from /usr/share/zoneinfo/zone1970.tab and set as regdom value.
+Default value is false.
+.TP
+.BI ResolvConf= string
+Path to resolv.conf file. If the file does not exist, but intermediate
+directories exist, it will be created.
+If this option is not set, it tries to write into
+@runstatedir@/connman/resolv.conf and fallbacks to @sysconfdir@/resolv.conf if
+it fails (@runstatedir@/connman does not exist or is not writeable).
+If you do not want to update resolv.conf, you can set /dev/null.
 .SH "EXAMPLE"
 The following example configuration disables hostname updates and enables
 ethernet tethering.

@@ -41,7 +41,15 @@ static GDBusClient *client;
 static GDBusProxy *agent_proxy;
 static GHashTable *adapters;
 static GHashTable *devices;
+/*
+ * Mapping from dbus path -> struct iwd_network, tracking the set of Network
+ * objects seen by iwd.
+ */
 static GHashTable *networks;
+/*
+ * Mapping from dbus path -> struct iwd_network, tracking the set of iwd
+ * KnownNetwork objects.
+ */
 static GHashTable *known_networks;
 static GHashTable *stations;
 static GHashTable *access_points;
@@ -84,6 +92,11 @@ struct iwd_device {
 	struct connman_device *device;
 };
 
+/*
+ * Structure tracking an net.connman.iwd.Network D-Bus object.
+ *
+ * This is mapped one-to-one to a connman_network object.
+ */
 struct iwd_network {
 	GDBusProxy *proxy;
 	char *path;
@@ -95,10 +108,17 @@ struct iwd_network {
 
 	struct iwd_device *iwdd;
 	struct connman_network *network;
-	/* service's autoconnect */
-	bool autoconnect;
+	/*
+	 * connman_service's autoconnect.
+	 *
+	 * See Note [Managing autoconnect state] for more details.
+	 */
+	bool cm_autoconnect;
 };
 
+/*
+ * Structure tracking a net.connman.iwd.KnownNetwork D-Bus object.
+ */
 struct iwd_known_network {
 	GDBusProxy *proxy;
 	char *path;
@@ -106,11 +126,15 @@ struct iwd_known_network {
 	char *type;
 	bool hidden;
 	char *last_connected_time;
-	bool auto_connect;
+	bool iwd_auto_connect;
 	int auto_connect_id;
 
-	/* service's autoconnect */
-	bool autoconnect;
+	/*
+	 * connman_service's autoconnect.
+	 *
+	 * See Note [Managing autoconnect state] for more details.
+	 */
+	bool cm_autoconnect;
 };
 
 struct iwd_station {
@@ -241,10 +265,12 @@ static void cm_network_connect_cb(DBusMessage *message, void *user_data)
 			return;
 
 		DBG("%s connect failed: %s", path, dbus_error);
-		if (!strcmp(dbus_error, "net.connman.iwd.Failed"))
+		if (!strcmp(dbus_error, "net.connman.iwd.Failed") ||
+				!strcmp(dbus_error,
+					"net.connman.iwd.InvalidFormat"))
 			connman_network_set_error(iwdn->network,
 					CONNMAN_NETWORK_ERROR_INVALID_KEY);
-		else if (!iwdn->autoconnect)
+		else if (!iwdn->cm_autoconnect)
 			connman_network_set_error(iwdn->network,
 					CONNMAN_NETWORK_ERROR_CONNECT_FAIL);
 		return;
@@ -268,6 +294,46 @@ static int cm_network_connect(struct connman_network *network)
 	connman_network_set_associating(iwdn->network, true);
 
 	return -EINPROGRESS;
+}
+
+static void cm_network_forget_cb(DBusMessage *message, void *user_data)
+{
+	struct iwd_known_network *iwdkn;
+	const char *path = user_data;
+
+	iwdkn = g_hash_table_lookup(known_networks, path);
+	if (!iwdkn)
+		return;
+
+	if (dbus_message_get_type(message) == DBUS_MESSAGE_TYPE_ERROR) {
+		const char *dbus_error = dbus_message_get_error_name(message);
+
+		DBG("%s failed: %s", path, dbus_error);
+	}
+}
+
+static int cm_network_forget(struct connman_network *network)
+{
+	struct iwd_network *iwdn = connman_network_get_data(network);
+	struct iwd_known_network *iwdkn;
+
+	if (!iwdn)
+		return -EINVAL;
+
+	if (!iwdn->known_network)
+		return 0;
+
+	iwdkn = g_hash_table_lookup(known_networks,
+				iwdn->known_network);
+	if (!iwdkn)
+		return 0;
+
+	if (!g_dbus_proxy_method_call(iwdkn->proxy, "Forget",
+			NULL, cm_network_forget_cb,
+			g_strdup(iwdkn->path), g_free))
+		return -EIO;
+
+	return 0;
 }
 
 static void cm_network_disconnect_cb(DBusMessage *message, void *user_data)
@@ -432,25 +498,25 @@ static int enable_auto_connect(struct iwd_known_network *iwdkn)
 
 static int update_auto_connect(struct iwd_known_network *iwdkn)
 {
-	DBG("auto_connect %d autoconnect %d", iwdkn->auto_connect, iwdkn->autoconnect);
+	DBG("iwd_auto_connect %d cm_autoconnect %d", iwdkn->iwd_auto_connect, iwdkn->cm_autoconnect);
 
-	if (iwdkn->auto_connect == iwdkn->autoconnect)
+	if (iwdkn->iwd_auto_connect == iwdkn->cm_autoconnect)
 		return -EALREADY;
 
-	if (iwdkn->autoconnect)
+	if (iwdkn->cm_autoconnect)
 		return enable_auto_connect(iwdkn);
 	return disable_auto_connect(iwdkn);
 }
 
 static int cm_network_set_autoconnect(struct connman_network *network,
-				bool autoconnect)
+				bool cm_autoconnect)
 {
 	struct iwd_network *iwdn = connman_network_get_data(network);
 	struct iwd_known_network *iwdkn;
 
-	DBG("autoconnect %d", autoconnect);
+	DBG("cm_autoconnect %d", cm_autoconnect);
 
-	iwdn->autoconnect = autoconnect;
+	iwdn->cm_autoconnect = cm_autoconnect;
 
 	if (!iwdn->known_network)
 		return -ENOENT;
@@ -459,7 +525,7 @@ static int cm_network_set_autoconnect(struct connman_network *network,
 	if (!iwdkn)
 		return -ENOENT;
 
-	iwdkn->autoconnect = autoconnect;
+	iwdkn->cm_autoconnect = cm_autoconnect;
 
 	return update_auto_connect(iwdkn);
 }
@@ -470,6 +536,7 @@ static struct connman_network_driver network_driver = {
 	.probe			= cm_network_probe,
 	.connect		= cm_network_connect,
 	.disconnect		= cm_network_disconnect,
+	.forget		= cm_network_forget,
 	.set_autoconnect	= cm_network_set_autoconnect,
 };
 
@@ -693,7 +760,7 @@ static void tech_enable_tethering_cb(const DBusError *error, void *user_data)
 	}
 
 	if (dbus_error_is_set(error)) {
-		connman_warn("iwd device %s could not enable AcessPoint mode: %s",
+		connman_warn("iwd device %s could not enable AccessPoint mode: %s",
 			cbd->path, error->message);
 		goto out;
 	}
@@ -745,6 +812,7 @@ static void tech_disable_tethering_cb(const DBusError *error, void *user_data)
 		goto out;
 	}
 
+	connman_technology_tethering_notify(cbd->tech, false);
 	iwdap = g_hash_table_lookup(access_points, iwdd->path);
 	if (!iwdap) {
 		DBG("%s no ap object found", iwdd->path);
@@ -755,11 +823,6 @@ static void tech_disable_tethering_cb(const DBusError *error, void *user_data)
 	iwdap->index = -1;
 	iwdap->bridge = NULL;
 	iwdap->tech = NULL;
-
-	if (!connman_inet_remove_from_bridge(cbd->index, cbd->bridge))
-		goto out;
-
-	connman_technology_tethering_notify(cbd->tech, false);
 
 	if (!g_dbus_proxy_method_call(iwdap->proxy, "Stop",
 					NULL, tech_ap_stop_cb, cbd, NULL)) {
@@ -786,6 +849,9 @@ static int cm_change_tethering(struct iwd_device *iwdd,
 	index = connman_inet_ifindex(iwdd->name);
 	if (index < 0)
 		return -ENODEV;
+
+	if (!enabled && connman_inet_remove_from_bridge(index, bridge))
+		return -EIO;
 
 	cbd = g_new(struct tech_cb_data, 1);
 	cbd->iwdd = iwdd;
@@ -1111,10 +1177,57 @@ static void network_property_change(GDBusProxy *proxy, const char *name,
 
 		iwdkn = g_hash_table_lookup(known_networks,
 					iwdn->known_network);
-		if (iwdkn)
+		if (iwdkn) {
+			/* See Note [Managing autoconnect state] */
+			iwdkn->cm_autoconnect = iwdn->cm_autoconnect;
 			update_auto_connect(iwdkn);
+		}
 	}
 }
+
+/*
+ * Note [Managing autoconnect state]:
+ *
+ * We need to set the iwd_known_network's cm_autoconnect status from the
+ * iwd_network, which has in turn been set to the corresponding
+ * connman_service's state when it first appeared (due to
+ * __connman_service_create_from_network).
+ *
+ * The management of the autoconnect state between ConnMan and its plugins and
+ * iwd is rather subtle and prone to bugs:
+ * - ConnMan itself determines the autoconnect state in struct connman_service,
+ *   which we cannot directly see; we only see cm_network_set_autoconnect
+ *   callbacks.
+ *
+ * - The iwd plugin maintains an independent state machine tracking iwd's view of
+ *   the world, which processes events in a non atomic fashion; for
+ *   instance, a iwd.KnownNetwork created event will appear before the
+ *   corresponding PropertyChanged setting the KnownNetwork property of the
+ *   iwd.Network corresponding to the created iwd.KnownNetwork.
+ *
+ * A typical flow of a network being newly connected to looks like so:
+ * - An iwd.Network appears, and add_network registers a connman_network
+ *   structure with ConnMan. ConnMan then in turn creates a service via
+ *   __connman_service_create_from_network.
+ *
+ * - The iwd plugin receives a callback from ConnMan to set the autoconnect
+ *   state, setting the cm_autoconnect state of the iwd_network. At this point,
+ *   there is no iwd_known_network yet.
+ *
+ * - ConnMan receives a Connect() request on the connman.Service, which is
+ *   forwarded to the iwd plugin via cm_network_connect. The iwd plugin calls
+ *   Connect() on the corresponding iwd.Network (possibly using the iwd
+ *   plugin's agent to get credentials if necessary).
+ *
+ * - Around the time that the connection completes, a iwd.KnownNetwork created
+ *   event appears, followed by a PropertyChanged event noting the change in
+ *   the iwd.Network's KnownNetwork property.
+ *
+ *   This is the first time that we can associate the iwd.KnownNetwork with the
+ *   corresponding iwd.Network and iwd_network. We have the ConnMan-side
+ *   autoconnect status in the iwd_network structure at this point, so we
+ *   synchronize the autoconnect state with iwd here.
+ */
 
 static unsigned char calculate_strength(int strength)
 {
@@ -1128,7 +1241,9 @@ static unsigned char calculate_strength(int strength)
 	 * ConnMan expects it in the range from 100 (strongest) to 0
 	 * (weakest).
 	 */
-	res = (unsigned char)((strength + 10000) / 100);
+	res = (unsigned char)(120 + strength / 100);
+	if (res > 100)
+		res = 100;
 
 	return res;
 }
@@ -1635,12 +1750,12 @@ static void known_network_property_change(GDBusProxy *proxy, const char *name,
 		return;
 
 	if (!strcmp(name, "AutoConnect")) {
-		dbus_bool_t auto_connect;
+		dbus_bool_t iwd_auto_connect;
 
-		dbus_message_iter_get_basic(iter, &auto_connect);
-		iwdkn->auto_connect = auto_connect;
+		dbus_message_iter_get_basic(iter, &iwd_auto_connect);
+		iwdkn->iwd_auto_connect = iwd_auto_connect;
 
-		DBG("%p auto_connect %d", path, iwdkn->auto_connect);
+		DBG("%s iwd_auto_connect %d", path, iwdkn->iwd_auto_connect);
 
 		update_auto_connect(iwdkn);
 	}
@@ -1664,13 +1779,13 @@ static void init_auto_connect(struct iwd_known_network *iwdkn)
 		if (iwdkn != kn)
 			continue;
 
-		iwdkn->autoconnect = iwdn->autoconnect;
+		iwdkn->cm_autoconnect = iwdn->cm_autoconnect;
 		update_auto_connect(iwdkn);
 		return;
 	}
 }
 
-static void create_know_network(GDBusProxy *proxy)
+static void create_known_network(GDBusProxy *proxy)
 {
 	const char *path = g_dbus_proxy_get_path(proxy);
 	struct iwd_known_network *iwdkn;
@@ -1692,12 +1807,22 @@ static void create_know_network(GDBusProxy *proxy)
 	iwdkn->hidden = proxy_get_bool(proxy, "Hidden");
 	iwdkn->last_connected_time =
 		g_strdup(proxy_get_string(proxy, "LastConnectedTime"));
-	iwdkn->auto_connect = proxy_get_bool(proxy, "AutoConnect");
+	iwdkn->iwd_auto_connect = proxy_get_bool(proxy, "AutoConnect");
 
-	DBG("name '%s' type %s hidden %d, last_connection_time %s auto_connect %d",
+	DBG("name '%s' type %s hidden %d, last_connection_time %s iwd_auto_connect %d",
 		iwdkn->name, iwdkn->type, iwdkn->hidden,
-		iwdkn->last_connected_time, iwdkn->auto_connect);
+		iwdkn->last_connected_time, iwdkn->iwd_auto_connect);
 
+	/*
+	 * Although we initialize the autoconnect state of this
+	 * iwd_known_network here, it is only initialized in the case of
+	 * networks that already existed prior to startup: in the
+	 * case of a new iwd.KnownNetwork appearing, we are called before the
+	 * iwd_network.known_network field is initialized by a subsequent
+	 * PropertyChanged event.
+	 *
+	 * See Note [Managing autoconnect state].
+	 */
 	init_auto_connect(iwdkn);
 
 	g_dbus_proxy_set_property_watch(iwdkn->proxy,
@@ -1781,7 +1906,7 @@ static void object_added(GDBusProxy *proxy, void *user_data)
 	else if (!strcmp(interface, IWD_NETWORK_INTERFACE))
 		create_network(proxy);
 	else if (!strcmp(interface, IWD_KNOWN_NETWORK_INTERFACE))
-		create_know_network(proxy);
+		create_known_network(proxy);
 	else if (!strcmp(interface, IWD_STATION_INTERFACE))
 		create_station(proxy);
 	else if (!strcmp(interface, IWD_AP_INTERFACE))

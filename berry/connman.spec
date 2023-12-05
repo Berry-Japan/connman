@@ -1,5 +1,5 @@
 %define name connman
-%define version 1.41
+%define version 1.42
 %define release b1
 %define _libdir /usr/lib
 
@@ -7,14 +7,15 @@ Name:		%{name}
 Version:	%{version}
 Release:	%{release}
 Summary:	Connection Manager
-License:	GPL-2.0-only
-Group:		System/Daemons
-URL:		http://www.moblin.org/
-Source0:	http://www.kernel.org/pub/linux/network/connman/connman-%{version}.tar.bz2
+License:	GPLv2
+Group:		System Environment/Networking
+URL:		https://www.moblin.org/
+Source0:	https://www.kernel.org/pub/linux/network/connman/connman-%{version}.tar.bz2
 Buildroot:	%{_tmppath}/%{name}-%{version}
 
 Requires:	iwd
-BuildRequires:	iptables-devel
+BuildRequires:	dbus-devel, iptables-devel
+#BuildRequires:	iptables-devel
 BuildRequires:	libmnl-devel
 BuildRequires:	readline-devel
 BuildRequires:	kernel-headers
@@ -31,7 +32,25 @@ within embedded devices running the Linux operating system.
 
 %prep
 %setup -q
-./configure --prefix=/usr --disable-debug --enable-iwd --disable-wispr --enable-nmcompat --enable-polkit
+#./configure --prefix=/usr --disable-debug --enable-iwd --disable-wispr --enable-nmcompat --enable-polkit
+%configure	--disable-debug \
+		--enable-iwd \
+		--disable-wispr \
+		--enable-nmcompat \
+		--enable-polkit \
+		--disable-static \
+		--enable-ethernet \
+		--enable-wifi \
+		--enable-udhcp \
+		--enable-bluetooth \
+		--enable-loopback \
+		--enable-dnsproxy \
+		--enable-resolvconf \
+		--enable-udev \
+		--enable-client \
+		--enable-threads \
+		--enable-google \
+		 CFLAGS=-Os
 
 
 ##
@@ -48,6 +67,7 @@ within embedded devices running the Linux operating system.
 
 %install
 %make_install
+strip $RPM_BUILD_ROOT/usr/sbin/connmand
 
 
 ##
@@ -88,7 +108,7 @@ rm -rf $RPM_BUILD_DIR/%{name}-%{version}
 ##
 
 %files
-%defattr (-,root,root)
+#%defattr (-,root,root)
 %{_bindir}/connmanctl
 %{_sbindir}/connmand
 %{_sbindir}/connman-vpnd

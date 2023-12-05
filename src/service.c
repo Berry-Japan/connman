@@ -137,7 +137,8 @@ struct connman_service {
 	char *pac;
 	bool wps;
 	bool wps_advertizing;
-	guint online_timeout;
+	guint online_timeout_ipv4;
+	guint online_timeout_ipv6;
 	unsigned int online_check_interval_ipv4;
 	unsigned int online_check_interval_ipv6;
 	bool do_split_routing;
@@ -155,6 +156,7 @@ static struct connman_ipconfig *create_ip6config(struct connman_service *service
 		int index);
 static void dns_changed(struct connman_service *service);
 static void vpn_auto_connect(void);
+static void trigger_autoconnect(struct connman_service *service);
 
 struct find_data {
 	const char *path;
@@ -1438,12 +1440,16 @@ static bool check_proxy_setup(struct connman_service *service)
 
 static void cancel_online_check(struct connman_service *service)
 {
-	if (service->online_timeout == 0)
-		return;
-
-	g_source_remove(service->online_timeout);
-	service->online_timeout = 0;
-	connman_service_unref(service);
+	if (service->online_timeout_ipv4) {
+		g_source_remove(service->online_timeout_ipv4);
+		service->online_timeout_ipv4 = 0;
+		connman_service_unref(service);
+	}
+	if (service->online_timeout_ipv6) {
+		g_source_remove(service->online_timeout_ipv6);
+		service->online_timeout_ipv6 = 0;
+		connman_service_unref(service);
+	}
 }
 
 static void start_online_check(struct connman_service *service,
@@ -1461,7 +1467,7 @@ static void start_online_check(struct connman_service *service,
 	online_check_max_interval =
 		connman_setting_get_uint("OnlineCheckMaxInterval");
 
-	if (type != CONNMAN_IPCONFIG_TYPE_IPV4 || check_proxy_setup(service)) {
+	if (type == CONNMAN_IPCONFIG_TYPE_IPV6 || check_proxy_setup(service)) {
 		cancel_online_check(service);
 		__connman_service_wispr_start(service, type);
 	}
@@ -1476,7 +1482,8 @@ static void address_updated(struct connman_service *service,
 		nameserver_add_all(service, type);
 		start_online_check(service, type);
 
-		__connman_timeserver_sync(service);
+		__connman_timeserver_sync(service,
+				CONNMAN_TIMESERVER_SYNC_REASON_ADDRESS_UPDATE);
 	}
 }
 
@@ -2592,7 +2599,6 @@ static void append_properties(DBusMessageIter *dict, dbus_bool_t limited,
 	case CONNMAN_SERVICE_TYPE_UNKNOWN:
 	case CONNMAN_SERVICE_TYPE_SYSTEM:
 	case CONNMAN_SERVICE_TYPE_GPS:
-	case CONNMAN_SERVICE_TYPE_VPN:
 	case CONNMAN_SERVICE_TYPE_P2P:
 		break;
 	case CONNMAN_SERVICE_TYPE_CELLULAR:
@@ -2603,6 +2609,7 @@ static void append_properties(DBusMessageIter *dict, dbus_bool_t limited,
 		connman_dbus_dict_append_dict(dict, "Ethernet",
 						append_ethernet, service);
 		break;
+	case CONNMAN_SERVICE_TYPE_VPN:
 	case CONNMAN_SERVICE_TYPE_WIFI:
 	case CONNMAN_SERVICE_TYPE_ETHERNET:
 	case CONNMAN_SERVICE_TYPE_BLUETOOTH:
@@ -3234,6 +3241,9 @@ int __connman_service_check_passphrase(enum connman_service_security security,
 	return 0;
 }
 
+static void set_error(struct connman_service *service,
+					enum connman_service_error error);
+
 int __connman_service_set_passphrase(struct connman_service *service,
 					const char *passphrase)
 {
@@ -3257,6 +3267,10 @@ int __connman_service_set_passphrase(struct connman_service *service,
 	if (service->network)
 		connman_network_set_string(service->network, "WiFi.Passphrase",
 				service->passphrase);
+
+	if (service->hidden_service &&
+			service->error == CONNMAN_SERVICE_ERROR_INVALID_KEY)
+		set_error(service, CONNMAN_SERVICE_ERROR_UNKNOWN);
 
 	return 0;
 }
@@ -3609,9 +3623,6 @@ void __connman_service_wispr_start(struct connman_service *service,
 
 	__connman_wispr_start(service, type);
 }
-
-static void set_error(struct connman_service *service,
-					enum connman_service_error error);
 
 static DBusMessage *set_property(DBusConnection *conn,
 					DBusMessage *msg, void *user_data)
@@ -4562,7 +4573,10 @@ static DBusMessage *connect_service(DBusConnection *conn,
 
 	DBG("service %p", service);
 
-	if (service->pending)
+	/* Hidden services do not keep the pending msg, check it from agent */
+	if (service->pending || (service->hidden &&
+				__connman_agent_is_request_pending(service,
+						dbus_message_get_sender(msg))))
 		return __connman_error_in_progress(msg);
 
 	index = __connman_service_get_index(service);
@@ -4631,6 +4645,8 @@ bool __connman_service_remove(struct connman_service *service)
 		return false;
 
 	__connman_service_disconnect(service);
+	if (service->network)
+		__connman_network_forget(service->network);
 
 	g_free(service->passphrase);
 	service->passphrase = NULL;
@@ -5613,6 +5629,9 @@ int __connman_service_set_favorite_delayed(struct connman_service *service,
 	service->favorite = favorite;
 
 	favorite_changed(service);
+	/* If native autoconnect is in use, the favorite state may affect the
+	 * autoconnect state, so it needs to be rerun. */
+	trigger_autoconnect(service);
 
 	if (!delay_ordering) {
 
@@ -6324,19 +6343,19 @@ static void service_rp_filter(struct connman_service *service,
 static void redo_wispr(struct connman_service *service,
 					enum connman_ipconfig_type type)
 {
-	service->online_timeout = 0;
-	connman_service_unref(service);
-
 	DBG("Retrying %s WISPr for %p %s",
 		__connman_ipconfig_type2string(type),
 		service, service->name);
 
 	__connman_wispr_start(service, type);
+	connman_service_unref(service);
 }
 
 static gboolean redo_wispr_ipv4(gpointer user_data)
 {
 	struct connman_service *service = user_data;
+
+	service->online_timeout_ipv4 = 0;
 
 	redo_wispr(service, CONNMAN_IPCONFIG_TYPE_IPV4);
 
@@ -6346,6 +6365,8 @@ static gboolean redo_wispr_ipv4(gpointer user_data)
 static gboolean redo_wispr_ipv6(gpointer user_data)
 {
 	struct connman_service *service = user_data;
+
+	service->online_timeout_ipv6 = 0;
 
 	redo_wispr(service, CONNMAN_IPCONFIG_TYPE_IPV6);
 
@@ -6359,6 +6380,10 @@ void __connman_service_online_check(struct connman_service *service,
 	GSourceFunc redo_func;
 	unsigned int *interval;
 	enum connman_service_state current_state;
+	int timeout;
+
+	DBG("service %p type %s success %d\n",
+		service, __connman_ipconfig_type2string(type), success);
 
 	if (type == CONNMAN_IPCONFIG_TYPE_IPV4) {
 		interval = &service->online_check_interval_ipv4;
@@ -6387,8 +6412,12 @@ redo_func:
 	DBG("service %p type %s interval %d", service,
 		__connman_ipconfig_type2string(type), *interval);
 
-	service->online_timeout = g_timeout_add_seconds(*interval * *interval,
+	timeout = g_timeout_add_seconds(*interval * *interval,
 				redo_func, connman_service_ref(service));
+	if (type == CONNMAN_IPCONFIG_TYPE_IPV4)
+		service->online_timeout_ipv4 = timeout;
+	else
+		service->online_timeout_ipv6 = timeout;
 
 	/* Increment the interval for the next time, set a maximum timeout of
 	 * online_check_max_interval seconds * online_check_max_interval seconds.
@@ -6501,7 +6530,8 @@ int __connman_service_ipconfig_indicate_state(struct connman_service *service,
 	if (!is_connected(old_state) && is_connected(new_state))
 		nameserver_add_all(service, type);
 
-	__connman_timeserver_sync(service);
+	__connman_timeserver_sync(service,
+				CONNMAN_TIMESERVER_SYNC_REASON_STATE_UPDATE);
 
 	return service_indicate_state(service);
 }
@@ -6796,6 +6826,13 @@ int __connman_service_connect(struct connman_service *service,
 			if (service->hidden) {
 				pending = service->pending;
 				service->pending = NULL;
+			}
+
+			if (service->hidden_service &&
+			service->error == CONNMAN_SERVICE_ERROR_INVALID_KEY) {
+				__connman_service_indicate_error(service,
+					CONNMAN_SERVICE_ERROR_INVALID_KEY);
+				return err;
 			}
 
 			err = __connman_agent_request_passphrase_input(service,
