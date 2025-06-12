@@ -233,7 +233,8 @@ static gboolean unref_web(gpointer user_data)
 	return FALSE;
 }
 
-static bool web_result(GWebResult *result, gpointer user_data)
+static bool web_result(const GError *error,
+		GWebResult *result, gpointer user_data)
 {
 	guint16 status;
 
@@ -318,7 +319,7 @@ static void tun_newlink(unsigned flags, unsigned change, void *user_data)
 			g_web_set_debug(web, web_debug, "6to4");
 
 		web_request_id = g_web_request_get(web, STATUS_URL,
-				web_result, NULL,  NULL);
+				web_result, NULL,  NULL, NULL);
 
 		newlink_timeout(NULL);
 	}

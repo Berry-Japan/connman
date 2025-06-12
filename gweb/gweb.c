@@ -39,6 +39,8 @@
 #include <netinet/tcp.h>
 #include <ifaddrs.h>
 
+#include <gio/gio.h>
+
 #include "giognutls.h"
 #include "gresolv.h"
 #include "gweb.h"
@@ -54,12 +56,44 @@ enum chunk_state {
 	CHUNK_DATA,
 };
 
+/**
+ *	The opaque structure presented to GWeb clients on received data or
+ *	request closures.
+ *
+ *  @private
+ */
 struct _GWebResult {
+	/**
+	 *	HTTP status code on success.
+	 */
 	guint16 status;
+
+	/**
+	 *	HTTP body content on success; otherwise, NULL.
+	 */
 	const guint8 *buffer;
+
+	/**
+	 *	HTTP body length on success; otherwise, 0.
+	 */
 	gsize length;
+
+	/**
+	 *	Boolean indicating whether the HTTP response uses HTTP/1.1
+	 *	chunked transfer encoding.
+	 */
 	bool use_chunk;
+
+	/**
+	 *	An optional pointer to a null-terminated C string containing
+	 *	the last HTTP header name added as part of a header key/value
+	 *	pair.
+	 */
 	gchar *last_key;
+
+	/**
+	 *	HTTP headers, on success, keyed by the header name.
+	 */
 	GHashTable *headers;
 };
 
@@ -75,6 +109,7 @@ struct web_session {
 	char *content_type;
 
 	GIOChannel *transport_channel;
+	guint connect_timeout;
 	guint transport_watch;
 	guint send_watch;
 
@@ -124,6 +159,7 @@ struct _GWeb {
 	char *user_agent_profile;
 	char *http_version;
 	bool close_connection;
+	guint connect_timeout_ms;
 
 	GWebDebugFunc debug_func;
 	gpointer debug_data;
@@ -131,6 +167,8 @@ struct _GWeb {
 
 #define debug(web, format, arg...)				\
 	_debug(web, __FILE__, __func__, format, ## arg)
+
+static void close_session_transport(struct web_session *session);
 
 static void _debug(GWeb *web, const char *file, const char *caller,
 						const char *format, ...)
@@ -153,12 +191,274 @@ static void _debug(GWeb *web, const char *file, const char *caller,
 	va_end(ap);
 }
 
+/**
+ *  Return the GWeb error quark.
+ *
+ *  @returns
+ *    The GWeb error GQuark.
+ */
+G_DEFINE_QUARK(g-web-error-quark, g_web_error)
+
+/**
+ *  @brief
+ *    Invoke the closure callback associated with the web session
+ *    request.
+ *
+ *  This closes the specified web session request by invoking the @a
+ *  result_func originally assigned in #do_request when the session
+ *  was first initiated.
+ *
+ *  @param[in]  session
+ *    A pointer to the mutable web session request for which to invoke
+ *    the closure callback.
+ *
+ *  @param[in]  error
+ *    An optional pointer to the immutable GError structure containing
+ *    information about an error that occurred during the GWeb request,
+ *    if any.
+ *
+ *  @sa call_result_func_failure
+ *  @sa call_result_func_success
+ *  @sa do_request
+ *
+ *  @private
+ *
+ */
+static void call_result_func(struct web_session *session,
+					const GError *error)
+{
+	debug(session->web, "session %p error %p result_func %p",
+		session, error, session->result_func);
+
+	if (!session->result_func)
+		return;
+
+	session->result_func(error, &session->result, session->user_data);
+}
+
+/**
+ *  @brief
+ *    Invoke the closure callback on failure associated with the web
+ *    session request.
+ *
+ *  This closes the specified web session request on failure with @a
+ *  error by invoking the @a result_func originally assigned in
+ *  #do_request when the session was first initiated.
+ *
+ *  @param[in]  session
+ *    A pointer to the mutable web session request for which to invoke
+ *    the closure callback.
+ *
+ *  @param[in]  error
+ *    A required pointer to the immutable GError structure containing
+ *    informatino about an error that occurred during the GWeb
+ *    request.
+ *
+ *  @sa call_result_func
+ *  @sa call_result_func_success
+ *  @sa do_request
+ *
+ *  @private
+ *
+ */
+static inline void call_result_func_failure(struct web_session *session,
+					const GError *error)
+{
+	call_result_func(session, error);
+}
+
+/**
+ *  @brief
+ *    Invoke the closure callback on success associated with the web
+ *    session request.
+ *
+ *  This closes the specified web session request on success by
+ *  invoking the @a result_func originally assigned in #do_request
+ *  when the session was first initiated.
+ *
+ *  @param[in]  session
+ *    A pointer to the mutable web session request for which to invoke
+ *    the closure callback.
+ *
+ *  @sa call_result_func
+ *  @sa call_result_func_failure
+ *  @sa do_request
+ *
+ *  @private
+ *
+ */
+static void call_result_func_success(struct web_session *session)
+{
+	call_result_func(session, NULL);
+}
+
+static inline void call_route_func(struct web_session *session)
+{
+	if (session->route_func)
+		session->route_func(session->address, session->addr->ai_family,
+				session->web->index, session->user_data);
+}
+
+/**
+ *  @brief
+ *    Handle a TCP connection timeout.
+ *
+ *  This callback handles a TCP connection timeout for a GWeb
+ *  connection. The session transport is closed and the GWeb
+ *  transaction is terminated with
+ *  #GWEB_HTTP_STATUS_CODE_REQUEST_TIMEOUT status.
+ *
+ *  param[in,out]  user_data  A pointer to the mutable GWeb session
+ *                            for which the TCP connection timed out.
+ *
+ *  @returns
+ *    G_SOURCE_REMOVE (that is, FALSE) unconditionally, indicating
+ *    that the timeout source that triggered this callback should be
+ *    removed on callback completion.
+ *
+ *  @sa add_connect_timeout
+ *  @sa cancel_connect_timeout
+ *
+ */
+static gboolean connect_timeout_cb(gpointer user_data)
+{
+	struct web_session *session = user_data;
+	g_autofree char *message = NULL;
+	g_autoptr(GError) local_error = NULL;
+
+	message = g_strdup_printf("connect timeout to %s after %ums",
+		session->address, g_web_get_connect_timeout(session->web));
+
+	debug(session->web, "session %p %s",
+			session, message);
+
+	session->connect_timeout = 0;
+
+	close_session_transport(session);
+
+	session->result.buffer = NULL;
+	session->result.length = 0;
+
+	local_error = g_error_new_literal(G_IO_ERROR,
+					G_IO_ERROR_TIMED_OUT,
+					message);
+
+	call_result_func_failure(session, local_error);
+
+	return G_SOURCE_REMOVE;
+}
+
+/**
+ *  @brief
+ *    Add a TCP connection timeout.
+ *
+ *  This attempts to add TCP connection timeout and callback to the
+ *  specified GWeb session. The timeout is successfully added if @a
+ *  session is non-null and @a timeout_ms is greater than zero.
+ *
+ *  @param[in,out]  session     A pointer to the mutable GWeb session
+ *                              to add the TCP connection timeout
+ *                              callback to.
+ *  param[in]       timeout_ms  The time, in milliseconds, for the TCP
+ *                              connection timeout. Connections that
+ *                              take longer than this will be
+ *                              aborted. A value of zero ('0')
+ *                              indicates that no explicit connection
+ *                              timeout will be used, leaving the
+ *                              timeout to the underlying operating
+ *                              system and its network stack.
+ *
+ *  @sa cancel_connect_timeout
+ *  @sa connect_timeout_cb
+ *
+ */
+static void add_connect_timeout(struct web_session *session,
+						guint timeout_ms)
+{
+	if (!session || !timeout_ms)
+		return;
+
+	debug(session->web, "add connect timeout %u ms", timeout_ms);
+
+	session->connect_timeout = g_timeout_add(timeout_ms,
+				connect_timeout_cb, session);
+}
+
+/**
+ *  @brief
+ *    Cancel a TCP connection timeout.
+ *
+ *  This attempts to cancel a TCP connection timeout and callback from
+ *  the specified GWeb session. The timeout is successfully cancelled
+ *  if @a session is non-null and its associated connect timeout
+ *  identifier is valid.
+ *
+ *  @param[in,out]  session     A pointer to the mutable GWeb session
+ *                              on which to cancel the TCP connection
+ *                              timeout.
+ *
+ *  @sa add_connect_timeout
+ *
+ */
+static void cancel_connect_timeout(struct web_session *session)
+{
+	if (!session)
+		return;
+
+	if (session->connect_timeout > 0) {
+		g_source_remove(session->connect_timeout);
+		session->connect_timeout = 0;
+
+		debug(session->web, "cancelled connect timeout");
+	}
+}
+
+/**
+ *  @brief
+ *    Close the TCP transport a GWeb sesssion.
+ *
+ *  This closes the TCP transport associated with the specified GWeb
+ *  session, removing its transport and send watches and releasing the
+ *  reference to the transport channel.
+ *
+ *  @param[in,out]  session     A pointer to the mutable GWeb session
+ *                              for which to close the session
+ *                              transport.
+ *
+ *  @sa connect_session_transport
+ *
+ */
+static void close_session_transport(struct web_session *session)
+{
+	if (!session)
+		return;
+
+	debug(session->web, "closing session transport");
+
+	if (session->transport_watch > 0) {
+		g_source_remove(session->transport_watch);
+		session->transport_watch = 0;
+	}
+
+	if (session->send_watch > 0) {
+		g_source_remove(session->send_watch);
+		session->send_watch = 0;
+	}
+
+	if (session->transport_channel) {
+		g_io_channel_unref(session->transport_channel);
+		session->transport_channel = NULL;
+	}
+}
+
 static void free_session(struct web_session *session)
 {
 	GWeb *web;
 
 	if (!session)
 		return;
+
+	debug(session->web, "session %p", session);
 
 	g_free(session->request);
 
@@ -170,14 +470,9 @@ static void free_session(struct web_session *session)
 	if (session->resolv_action > 0)
 		g_resolv_cancel_lookup(web->resolv, session->resolv_action);
 
-	if (session->transport_watch > 0)
-		g_source_remove(session->transport_watch);
+	cancel_connect_timeout(session);
 
-	if (session->send_watch > 0)
-		g_source_remove(session->send_watch);
-
-	if (session->transport_channel)
-		g_io_channel_unref(session->transport_channel);
+	close_session_transport(session);
 
 	g_free(session->result.last_key);
 
@@ -205,6 +500,8 @@ static void free_session(struct web_session *session)
 static void flush_sessions(GWeb *web)
 {
 	GList *list;
+
+	debug(web, "flushing sessions...");
 
 	for (list = g_list_first(web->session_list);
 					list; list = g_list_next(list))
@@ -252,18 +549,17 @@ GWeb *g_web_ref(GWeb *web)
 	if (!web)
 		return NULL;
 
+	debug(web, "ref %d",
+		web->ref_count + 1);
+
 	__sync_fetch_and_add(&web->ref_count, 1);
 
 	return web;
 }
 
-void g_web_unref(GWeb *web)
+static void g_web_free(GWeb *web)
 {
-	if (!web)
-		return;
-
-	if (__sync_fetch_and_sub(&web->ref_count, 1) != 1)
-		return;
+	debug(web, "freeing...");
 
 	flush_sessions(web);
 
@@ -277,6 +573,20 @@ void g_web_unref(GWeb *web)
 	g_free(web->http_version);
 
 	g_free(web);
+}
+
+void g_web_unref(GWeb *web)
+{
+	if (!web)
+		return;
+
+	debug(web, "ref %d",
+		web->ref_count - 1);
+
+	if (__sync_fetch_and_sub(&web->ref_count, 1) != 1)
+		return;
+
+	g_web_free(web);
 }
 
 bool g_web_supports_tls(void)
@@ -445,24 +755,69 @@ bool g_web_get_close_connection(GWeb *web)
 	return web->close_connection;
 }
 
-static inline void call_result_func(struct web_session *session, guint16 status)
+/**
+ *  @brief
+ *    Set the TCP connection timeout.
+ *
+ *  This sets the TCP connection timeout, in milliseconds, for the
+ *  specified GWeb object.
+ *
+ *  param[in,out]  web         A pointer to the mutable GWeb object
+ *                             for which the TCP connection timeout is
+ *                             to be set.
+ *  param[in]      timeout_ms  The time, in milliseconds, for the TCP
+ *                             connection timeout. Connections that
+ *                             take longer than this will be
+ *                             aborted. A value of zero ('0')
+ *                             indicates that no explicit connection
+ *                             timeout will be used, leaving the
+ *                             timeout to the underlying operating
+ *                             system and its network stack.
+ *
+ *  @sa g_web_get_connect_timeout
+ *
+ */
+void g_web_set_connect_timeout(GWeb *web, guint timeout_ms)
 {
-
-	if (!session->result_func)
+	if (!web)
 		return;
 
-	if (status != 0)
-		session->result.status = status;
+	debug(web, "timeout %ums", timeout_ms);
 
-	session->result_func(&session->result, session->user_data);
-
+	web->connect_timeout_ms = timeout_ms;
 }
 
-static inline void call_route_func(struct web_session *session)
+/**
+ *  @brief
+ *    Set the TCP connection timeout.
+ *
+ *  This sets the TCP connection timeout, in milliseconds, for the
+ *  specified GWeb object.
+ *
+ *  param[in]  web             A pointer to the immutable GWeb object
+ *                             for which the TCP connection timeout is
+ *                             to be returned.
+ *
+ *  @returns
+ *    The TCP connection timeout, in milliseconds. A value of zero
+ *    ('0') indicates that no explicit connection timeout has been
+ *    set, leaving the timeout to the underlying operating system and
+ *    its network stack.
+ *
+ *  @sa g_web_set_connect_timeout
+ *
+ */
+guint g_web_get_connect_timeout(const GWeb *web)
 {
-	if (session->route_func)
-		session->route_func(session->address, session->addr->ai_family,
-				session->web->index, session->user_data);
+	guint timeout_ms = 0;
+
+	if (!web)
+		goto done;
+
+	timeout_ms = web->connect_timeout_ms;
+
+done:
+	return timeout_ms;
 }
 
 static bool process_send_buffer(struct web_session *session)
@@ -729,7 +1084,7 @@ static int decode_chunked(struct web_session *session,
 			if (session->chunk_left <= len) {
 				session->result.buffer = ptr;
 				session->result.length = session->chunk_left;
-				call_result_func(session, 0);
+				call_result_func_success(session);
 
 				len -= session->chunk_left;
 				ptr += session->chunk_left;
@@ -744,7 +1099,7 @@ static int decode_chunked(struct web_session *session,
 			/* more data */
 			session->result.buffer = ptr;
 			session->result.length = len;
-			call_result_func(session, 0);
+			call_result_func_success(session);
 
 			session->chunk_left -= len;
 			session->total_len += len;
@@ -762,6 +1117,8 @@ static int handle_body(struct web_session *session,
 				const guint8 *buf, gsize len)
 {
 	int err;
+	g_autofree char *message = NULL;
+	g_autoptr(GError) local_error = NULL;
 
 	debug(session->web, "[body] length %zu", len);
 
@@ -769,18 +1126,25 @@ static int handle_body(struct web_session *session,
 		if (len > 0) {
 			session->result.buffer = buf;
 			session->result.length = len;
-			call_result_func(session, 0);
+			call_result_func_success(session);
 		}
 		return 0;
 	}
 
 	err = decode_chunked(session, buf, len);
 	if (err < 0) {
-		debug(session->web, "Error in chunk decode %d", err);
+		message = g_strdup_printf("Error in chunk decode %d", err);
+
+		debug(session->web, message);
 
 		session->result.buffer = NULL;
 		session->result.length = 0;
-		call_result_func(session, 400);
+
+		local_error = g_error_new_literal(G_WEB_ERROR,
+			G_WEB_ERROR_CHUNK_DECODE,
+			message);
+
+		call_result_func_failure(session, local_error);
 	}
 
 	return err;
@@ -864,35 +1228,122 @@ static void add_header_field(struct web_session *session)
 	}
 }
 
-static gboolean received_data(GIOChannel *channel, GIOCondition cond,
-							gpointer user_data)
+/**
+ *  @brief
+ *    Finalize a glib I/O channel watch received data delegation for a
+ *    web session request.
+ *
+ *  This finalizes a glib I/O channel received data failure or
+ *  success for @a session. This assumes that @a status is either
+ *  #G_IO_STATUS_ERROR or #G_IO_STATUS_EOF. #G_IO_STATUS_ERROR
+ *  represents an unconditional failure completion. #G_IO_STATUS_EOF
+ *  may represent a successful completion, if it follows one more
+ *  prior received data transfers for @a session. However, it
+ *  represents a failure completion if it occurs prior to the receipt
+ *  of any @a session data.
+ *
+ *  @param[in,out]  session          A pointer to the mutable web
+ *                                   session request to finalize.
+ *  @param[in]      status           The status from the prior call
+ *                                   to #g_io_channel_read_chars used
+ *                                   to determine how to finalize @a
+ *                                   session.
+ *  @param[in]      bytes_available  The number of bytes advertised
+ *                                   to the prior call to
+ *                                   #g_io_channel_read_chars.
+ *  @param[in]      bytes_read       The number of bytes read by the
+ *                                   prior call to
+ *                                   #g_io_channel_read_chars.
+ *  @param[in]      error            An optional pointer to the glib
+ *                                   error instance associated the
+ *                                   prior call to
+ *                                   #g_io_channel_read_chars.
+ *
+ *  @sa received_data_continue
+ *  @sa received_data
+ *
+ *  @private
+ *
+ */
+static void received_data_finalize(struct web_session *session,
+				GIOStatus status, gsize bytes_available,
+				gsize bytes_read, const GError *error)
 {
-	struct web_session *session = user_data;
+	g_autoptr(GError) local_error = NULL;
+	const GError *passed_error = NULL;
+
+	session->transport_watch = 0;
+
+	session->result.buffer = NULL;
+	session->result.length = 0;
+
+	/* Handle post-channel read errors, which could be either
+	 * G_IO_STATUS_ERROR or G_IO_STATUS_EOF.
+	 *
+	 * For G_IO_STATUS_ERROR, simply pass through the GError, if
+	 * non-null. If there is no GError, create a GError anew based on
+	 * EIO.
+	 *
+	 * For G_IO_STATUS_EOF, this could occur at the end of a nominal,
+	 * successful get. That is, some number of headers, with or
+	 * without a body, termiated by an expected end-of-file (EOF)
+	 * condition. However, G_IO_STATUS_EOF can also happen as a result
+	 * of the remote peer server unexpectedly terminating the
+	 * connection without transferring any data at all. The only
+	 * reasonable recovery for this case it to fail the request,
+	 * synthesizing ECONNRESET as the error, and to let the client
+	 * request again.
+	 *
+	 * If we asked for a non-zero amount of data but received none and
+	 * have accumulated no headers thus far, then we assume that the
+	 * remote peer server unexpectedly closed the connection;
+	 * otherwise, we assume it is a normal EOF closure.
+	 */
+
+	if (status == G_IO_STATUS_ERROR) {
+		if (error != NULL)
+			passed_error = error;
+		else {
+			local_error = g_error_new_literal(G_IO_ERROR,
+				g_io_error_from_errno(EIO),
+				g_strerror(EIO));
+			passed_error = local_error;
+		}
+	} else if (status == G_IO_STATUS_EOF) {
+		if (bytes_available > 0 &&
+				bytes_read == 0 &&
+				!g_web_result_has_headers(&session->result, NULL)) {
+			local_error = g_error_new_literal(G_IO_ERROR,
+				g_io_error_from_errno(ECONNRESET),
+				g_strerror(ECONNRESET));
+			passed_error = local_error;
+		}
+	}
+
+	call_result_func_failure(session, passed_error);
+}
+
+/**
+ *  @brief
+ *    Continue a glib I/O channel watch received data delegation for a
+ *    web session request and process the data from it.
+ *
+ *  @param[in,out]  session     A pointer to the mutable web session
+ *                              request to continue and process
+ *                              received data for.
+ *  @param[in]      bytes_read  The number of bytes read by the prior
+ *                              call to #g_io_channel_read_chars.
+ *
+ *  @sa received_data_finalize
+ *  @sa received_data
+ *
+ *  @private
+ *
+ */
+static bool received_data_continue(struct web_session *session,
+				gsize bytes_read)
+{
 	guint8 *ptr = session->receive_buffer;
-	gsize bytes_read;
-	GIOStatus status;
-
-	if (cond & (G_IO_NVAL | G_IO_ERR | G_IO_HUP)) {
-		session->transport_watch = 0;
-		session->result.buffer = NULL;
-		session->result.length = 0;
-		call_result_func(session, 400);
-		return FALSE;
-	}
-
-	status = g_io_channel_read_chars(channel,
-				(gchar *) session->receive_buffer,
-				session->receive_space - 1, &bytes_read, NULL);
-
-	debug(session->web, "bytes read %zu", bytes_read);
-
-	if (status != G_IO_STATUS_NORMAL && status != G_IO_STATUS_AGAIN) {
-		session->transport_watch = 0;
-		session->result.buffer = NULL;
-		session->result.length = 0;
-		call_result_func(session, 0);
-		return FALSE;
-	}
 
 	session->receive_buffer[bytes_read] = '\0';
 
@@ -960,7 +1411,7 @@ static gboolean received_data(GIOChannel *channel, GIOCondition cond,
 
 		str = session->current_header->str;
 
-		if (session->result.status == 0) {
+		if (session->result.status == GWEB_HTTP_STATUS_CODE_UNKNOWN) {
 			unsigned int code;
 
 			if (sscanf(str, "HTTP/%*s %u %*s", &code) == 1)
@@ -979,6 +1430,87 @@ static gboolean received_data(GIOChannel *channel, GIOCondition cond,
 	}
 
 	return TRUE;
+}
+
+/**
+ *  @brief
+ *    Handle a glib I/O channel watch received data delegation for a
+ *    web session request.
+ *
+ *  This handles a glib I/O channel received data delegate for the web
+ *  session request associated with @a channel.
+ *
+ *  @param[in,out]  channel    A pointer to the glib channel that
+ *                             received data or a condition(s)/
+ *                             event(s).
+ *  @param[in]      cond       The conditions or events that
+ *                             generated this delegation.
+ *  @param[in,out]  user_data  A pointer to the mutable web session
+ *                             request associated with @a channel.
+ *
+ *  @sa received_data_finalize
+ *  @sa received_data_continue
+ *
+ *  @private
+ *
+ */
+static gboolean received_data(GIOChannel *channel, GIOCondition cond,
+							gpointer user_data)
+{
+	struct web_session *session = user_data;
+	const gsize bytes_available = session->receive_space - 1;
+	gsize bytes_read;
+	GIOStatus status;
+	g_autoptr(GError) local_error = NULL;
+	g_autoptr(GError) error = NULL;
+
+	/* We received some data or condition, cancel the connect timeout. */
+
+	cancel_connect_timeout(session);
+
+	/* If there was a low-level I/O condition or error, there is
+	 * nothing more to do; simply fail the request.
+	 */
+
+	if (cond & (G_IO_NVAL | G_IO_ERR | G_IO_HUP)) {
+		session->transport_watch = 0;
+
+		session->result.buffer = NULL;
+		session->result.length = 0;
+
+		local_error = g_error_new_literal(G_IO_ERROR,
+			g_io_error_from_errno(EIO),
+			g_strerror(EIO));
+
+		call_result_func_failure(session, local_error);
+
+		return FALSE;
+	}
+
+	/* Attempt to read received data from the channel. */
+
+	status = g_io_channel_read_chars(channel,
+				(gchar *) session->receive_buffer,
+				bytes_available, &bytes_read, &error);
+
+	debug(session->web, "bytes read %zu status %d error %p", bytes_read,
+		status, error);
+
+	/* Handle post-channel read errors, which could be either
+	 * G_IO_STATUS_ERROR or G_IO_STATUS_EOF.
+	 */
+	if (status != G_IO_STATUS_NORMAL && status != G_IO_STATUS_AGAIN) {
+		received_data_finalize(session, status,
+			bytes_available, bytes_read, error);
+
+		return FALSE;
+	}
+
+	/* Otherwise, continue the session request and process the
+	 * received data.
+	 */
+
+	return received_data_continue(session, bytes_read);
 }
 
 static int bind_to_address(int sk, const char *interface, int family)
@@ -1032,7 +1564,41 @@ static inline int bind_socket(int sk, int index, int family)
 	return err;
 }
 
-static int connect_session_transport(struct web_session *session)
+/**
+ *  @brief
+ *    Establish TCP connection for a GWeb session.
+ *
+ *  This attempts to establish a TCP connection for the specified GWeb
+ *  session with the session-specified address family, peer address,
+ *  and bound network interface.
+ *
+ *  @param[in,out]  session             A pointer to the mutable GWeb
+ *                                      session for which to establish
+ *                                      the session transport.
+ *  param[in]       connect_timeout_ms  The time, in milliseconds, for
+ *                                      the TCP connection timeout.
+ *                                      Connections that take longer
+ *                                      than this will be aborted. A
+ *                                      value of zero ('0') indicates
+ *                                      that no explicit connection
+ *                                      timeout will be used, leaving
+ *                                      the timeout to the underlying
+ *                                      operating system and its
+ *                                      network stack.
+ *
+ *  @retval  0        If successful.
+ *  @retval  -EIO     If a socket could not be created for the specified
+ *                    session address family, the socket could not be
+ *                    bound to the specified session network
+ *                    interface, or the socket could not connect to
+ *                    the specified session peer address.
+ *  @retval  -ENOMEM  If a GLib transport channel could not be created.
+ *
+ *  @sa close_session_transport
+ *
+ */
+static int connect_session_transport(struct web_session *session,
+			guint connect_timeout_ms)
 {
 	GIOFlags flags;
 	int sk;
@@ -1090,6 +1656,8 @@ static int connect_session_transport(struct web_session *session)
 				G_IO_OUT | G_IO_HUP | G_IO_NVAL | G_IO_ERR,
 						send_data, session);
 
+	add_connect_timeout(session, connect_timeout_ms);
+
 	return 0;
 }
 
@@ -1097,7 +1665,8 @@ static int create_transport(struct web_session *session)
 {
 	int err;
 
-	err = connect_session_transport(session);
+	err = connect_session_transport(session,
+			g_web_get_connect_timeout(session->web));
 	if (err < 0)
 		return err;
 
@@ -1107,108 +1676,832 @@ static int create_transport(struct web_session *session)
 	return 0;
 }
 
-static int parse_url(struct web_session *session,
-				const char *url, const char *proxy)
+/**
+ *  @brief
+ *    Attempt to parse the scheme component from a URL.
+ *
+ *  This attempts to parse the scheme component from the specified URL
+ *  of the provided length at the specified cursor point in the
+ *  URL. If provided, the parsed scheme is copied and
+ *  assigned to @a scheme.
+ *
+ *  @note
+ *    The caller is responsible for deallocating the memory assigned
+ *    to @a *scheme, if provided, on success.
+ *
+ *  @param[in]      url             A pointer to the immutable string,
+ *                                  of length @a url_length, from
+ *                                  which to parse the scheme
+ *                                  component.
+ *  @param[in]      url_length      The length, in bytes, of @a url.
+ *  @param[in,out]  cursor          A pointer to the current parsing
+ *                                  position within @a url at which to
+ *                                  start parsing the scheme. On
+ *                                  success, this is updated to the
+ *                                  first byte past the parsed scheme.
+ *  @param[in,out]  scheme          An optional pointer to storage to
+ *                                  assign a copy of the parsed scheme
+ *                                  on success.
+ *
+ *  @retval  0        If successful.
+ *  @retavl  -EINVAL  If @a url was null, @a url_length was zero, or @a
+ *                    cursor was null.
+ *
+ *  @sa parse_url_components
+ *
+ */
+static int parse_url_scheme(const char *url, size_t url_length,
+						const char **cursor,
+						char **scheme)
 {
-	char *scheme, *host, *port, *path;
+	static const char * const scheme_delimiter = "://";
+	static const size_t scheme_delimiter_length = 3;
+	const char *result;
+	size_t remaining_length;
+	size_t scheme_length = 0;
 
-	scheme = g_strdup(url);
-	if (!scheme)
+	if (!url || !url_length || !cursor)
 		return -EINVAL;
 
-	host = strstr(scheme, "://");
-	if (host) {
-		*host = '\0';
-		host += 3;
+	remaining_length = url_length - (size_t)(*cursor - url);
+	if (remaining_length) {
+		result = memmem(*cursor,
+					remaining_length,
+					scheme_delimiter,
+					scheme_delimiter_length);
+		if (result) {
+			scheme_length = (size_t)(result - *cursor);
 
-		if (strcasecmp(scheme, "https") == 0) {
-			session->port = 443;
-			session->flags |= SESSION_FLAG_USE_TLS;
-		} else if (strcasecmp(scheme, "http") == 0) {
-			session->port = 80;
-		} else {
-			g_free(scheme);
+			if (scheme)
+				*scheme = g_strndup(*cursor, scheme_length);
+
+			*cursor += scheme_length + scheme_delimiter_length;
+		} else if (scheme)
+			*scheme = NULL;
+	} else if (scheme)
+		*scheme = NULL;
+
+	return 0;
+}
+
+/**
+ *  @brief
+ *    Attempt to parse the host component from a URL.
+ *
+ *  This attempts to parse the host component from the specified
+ *  URL of the provided length at the specified cursor point in the
+ *  URL. If provided, the parsed host is copied and assigned to @a
+ *  host.
+ *
+ *  Compliant with RFC 2732, the format of the host component of the
+ *  URL may be one of the following:
+ *
+ *    1. "[\<IPv6 Address>]"
+ *    2. "[\<IPv6 Address>]:<Port>"
+ *    4. "\<IPv4 Address>"
+ *    5. "\<IPv4 Address>:<Port>"
+ *    6. "\<Host Name>"
+ *    7. "\<Host Name>:<Port>"
+ *
+ *  @note
+ *    The caller is responsible for deallocating the memory assigned
+ *    to @a *host, if provided, on success.
+ *
+ *  @param[in]      url             A pointer to the immutable string,
+ *                                  of length @a url_length, from
+ *                                  which to parse the host
+ *                                  component.
+ *  @param[in]      url_length      The length, in bytes, of @a url.
+ *  @param[in,out]  cursor          A pointer to the current parsing
+ *                                  position within @a url at which to
+ *                                  start parsing the host. On
+ *                                  success, this is updated to the
+ *                                  first byte past the parsed host.
+ *  @param[in,out]  host            An optional pointer to storage to
+ *                                  assign a copy of the parsed host
+ *                                  on success.
+ *
+ *  @retval  0        If successful.
+ *  @retavl  -EINVAL  If @a url was null, @a url_length was zero, @a
+ *                    cursor was null, or if the host portion of @a
+ *                    url is malformed.
+ *
+ *  @sa parse_url_host_and_port
+ *  @sa parse_url_components
+ *
+ */
+static int parse_url_host(const char *url, size_t url_length,
+						const char **cursor,
+						char **host)
+{
+	static char port_delimiter = ':';
+	static char path_delimiter = '/';
+	size_t remaining_length;
+	size_t host_length	= 0;
+	const char *result;
+	const char *opening_bracket;
+	const char *closing_bracket;
+	int err = 0;
+
+	if (!url || !url_length || !cursor)
+		return -EINVAL;
+
+	/*
+	 * Since it's the easiest to detect, first rule out an IPv6
+	 * address. The only reliably way to do so is to search for the
+	 * delimiting '[' and ']'. Searching for ':' may incorrectly yield
+	 * one of the other forms above (for example, (2), (5), or (7)).
+	 */
+	remaining_length = url_length - (size_t)(*cursor - url);
+
+	opening_bracket = memchr(*cursor, '[', remaining_length);
+	if (opening_bracket) {
+		/*
+		 * We found an opening bracket; this might be an IPv6
+		 * address. Search for its peer closing bracket.
+		 */
+		remaining_length = url_length - (size_t)(opening_bracket - url);
+
+		closing_bracket = memchr(opening_bracket,
+								']',
+								remaining_length);
+		if (!closing_bracket)
 			return -EINVAL;
-		}
+
+		/*
+		 * Assign the first character of the IPv6 address after the
+		 * opening bracket up to, but not including, the closing
+		 * bracket to the host name.
+		 */
+		host_length = closing_bracket - opening_bracket - 1;
+
+		if (host_length && host)
+			*host = g_strndup(opening_bracket + 1, host_length);
 	} else {
-		host = scheme;
-		session->port = 80;
+		/*
+		 * At this point, we either have an IPv4 address or a host
+		 * name, maybe with a port and maybe with a path.
+		 *
+		 * Whether we have a port or not, we definitively know where
+		 * the IPv4 address or host name ends. If we have a port, it
+		 * ends at the port delimiter, ':'. If we don't have a port,
+		 * then it ends at the end of the string or at the path
+		 * delimiter, if any.
+		 */
+		result = memchr(*cursor, port_delimiter, remaining_length);
+
+		/*
+		 * There was no port delimiter; attempt to find a path
+		 * delimiter.
+		 */
+		if (!result)
+			result = memchr(*cursor, path_delimiter, remaining_length);
+
+		/*
+		 * Whether stopping at the port or path delimiter, if we had a
+		 * result, the end of the host is the span from the cursor to
+		 * that result. Otherwise, it is simply the remaining length
+		 * of the string.
+		 */
+		if (result)
+			host_length = result - *cursor;
+		else
+			host_length = remaining_length;
+
+		if (host_length && host)
+			*host = g_strndup(*cursor, host_length);
 	}
 
-	path = strchr(host, '/');
-	if (path)
-		*(path++) = '\0';
-
-	if (!proxy)
-		session->request = g_strdup_printf("/%s", path ? path : "");
+	if (!host_length)
+		err = -EINVAL;
 	else
-		session->request = g_strdup(url);
+		*cursor += host_length;
 
-	port = strrchr(host, ':');
-	if (port) {
-		char *end;
-		int tmp = strtol(port + 1, &end, 10);
+	return err;
+}
 
-		if (*end == '\0') {
-			*port = '\0';
-			session->port = tmp;
+/**
+ *  @brief
+ *    Attempt to parse the port component from a URL.
+ *
+ *  This attempts to parse the port component from the specified URL
+ *  of the provided length at the specified cursor point in the
+ *  URL. If provided, the parsed port is assigned to @a port.
+ *
+ *  Compliant with RFC 2732, the format of the host component of the
+ *  URL may be one of the following:
+ *
+ *    1. "[\<IPv6 Address>]"
+ *    2. "[\<IPv6 Address>]:<Port>"
+ *    4. "\<IPv4 Address>"
+ *    5. "\<IPv4 Address>:<Port>"
+ *    6. "\<Host Name>"
+ *    7. "\<Host Name>:<Port>"
+ *
+ *  @param[in]      url             A pointer to the immutable string,
+ *                                  of length @a url_length, from
+ *                                  which to parse the port
+ *                                  component.
+ *  @param[in]      url_length      The length, in bytes, of @a url.
+ *  @param[in,out]  cursor          A pointer to the current parsing
+ *                                  position within @a url at which to
+ *                                  start parsing the port. On
+ *                                  success, this is updated to the
+ *                                  first byte past the parsed port.
+ *  @param[in,out]  port            An optional pointer to storage to
+ *                                  assign the parsed port on
+ *                                  success. On failure or absence of
+ *                                  a port to parsed, this is assigned
+ *                                  -1.
+ *
+ *  @retval  0        If successful.
+ *  @retavl  -EINVAL  If @a url was null, @a url_length was zero, @a
+ *                    cursor was null, or if there were no characters
+ *                    to parse after the port delimiter (':').
+ *  @retval  -ERANGE  If the parsed port was outside of the range [0,
+ *                    65535], inclusive.
+ *
+ *  @sa parse_url_host_and_port
+ *  @sa parse_url_components
+ *
+ */
+static int parse_url_port(const char *url, size_t url_length,
+						const char **cursor,
+						int16_t *port)
+{
+	static char port_delimiter = ':';
+	static const size_t port_delimiter_length = 1;
+	const char *result;
+	size_t remaining_length;
+	size_t port_length = 0;
+	char *end;
+	unsigned long tmp_port;
+
+	if (!url || !url_length || !cursor)
+		return -EINVAL;
+
+	remaining_length = url_length - (size_t)(*cursor - url);
+
+	result = memchr(*cursor, port_delimiter, remaining_length);
+	if (result) {
+		tmp_port = strtoul(result + port_delimiter_length, &end, 10);
+		if (tmp_port == ULONG_MAX)
+			return -ERANGE;
+		else if (tmp_port > UINT16_MAX)
+			return -ERANGE;
+		else if (result + port_delimiter_length == end)
+			return -EINVAL;
+
+		port_length = end - (result + port_delimiter_length);
+
+		*cursor += port_length;
+	} else
+		tmp_port = -1;
+
+	if (port)
+		*port = (int16_t)tmp_port;
+
+	return 0;
+}
+
+/**
+ *  @brief
+ *    Attempt to parse the host and port components from a URL.
+ *
+ *  This attempts to parse the host and port components from the
+ *  specified URL of the provided length at the specified cursor point
+ *  in the URL. If provided, the parsed host is copied and assigned to
+ *  @a host and, if provided, the parsed port is assigned to @a port.
+ *
+ *  Compliant with RFC 2732, the format of the host component of the
+ *  URL may be one of the following:
+ *
+ *    1. "[\<IPv6 Address>]"
+ *    2. "[\<IPv6 Address>]:<Port>"
+ *    4. "\<IPv4 Address>"
+ *    5. "\<IPv4 Address>:<Port>"
+ *    6. "\<Host Name>"
+ *    7. "\<Host Name>:<Port>"
+ *
+ *  @note
+ *    The caller is responsible for deallocating the memory assigned
+ *    to @a *host, if provided, on success.
+ *
+ *  @param[in]      url             A pointer to the immutable string,
+ *                                  of length @a url_length, from
+ *                                  which to parse the host and port
+ *                                  components.
+ *  @param[in]      url_length      The length, in bytes, of @a url.
+ *  @param[in,out]  cursor          A pointer to the current parsing
+ *                                  position within @a url at which to
+ *                                  start parsing the host and
+ *                                  port. On success, this is updated
+ *                                  to the first byte past the parsed
+ *                                  host or port, if present.
+ *  @param[in,out]  host            An optional pointer to storage to
+ *                                  assign a copy of the parsed host
+ *                                  on success.
+ *  @param[in,out]  port            An optional pointer to storage to
+ *                                  assign the parsed port on
+ *                                  success. On failure or absence of
+ *                                  a port to parsed, this is assigned
+ *                                  -1.
+ *
+ *  @retval  0        If successful.
+ *  @retavl  -EINVAL  If @a url was null, @a url_length was zero, @a
+ *                    cursor was null, if the host portion of @a url
+ *                    is malformed, or if there were no characters to
+ *                    parse after the port delimiter (':').
+ *  @retval  -ERANGE  If the parsed port was outside of the range [0,
+ *                    65535], inclusive.
+ *
+ *  @sa parse_url_host
+ *  @sa parse_url_port
+ *  @sa parse_url_components
+ *
+ */
+static int parse_url_host_and_port(const char *url, size_t url_length,
+						const char **cursor,
+						char **host,
+						int16_t *port)
+{
+	g_autofree char *temp_host = NULL;
+	int err = 0;
+
+	if (!url || !url_length || !cursor)
+		return -EINVAL;
+
+	/* Attempt to handle the host component. */
+
+	err = parse_url_host(url, url_length, cursor, &temp_host);
+	if (err != 0)
+		goto done;
+
+	/* Attempt to handle the port component. */
+
+	err = parse_url_port(url, url_length, cursor, port);
+	if (err != 0)
+		goto done;
+
+	if (host)
+		*host = g_steal_pointer(&temp_host);
+
+done:
+	return err;
+}
+
+/**
+ *  @brief
+ *    Attempt to parse the path component from a URL.
+ *
+ *  This attempts to parse the path component from the specified
+ *  URL of the provided length at the specified cursor point in the
+ *  URL. If provided, the parsed path is copied and assigned to @a
+ *  path.
+ *
+ *  @note
+ *    The caller is responsible for deallocating the memory assigned
+ *    to @a *path, if provided, on success.
+ *
+ *  @param[in]      url             A pointer to the immutable string,
+ *                                  of length @a url_length, from
+ *                                  which to parse the path
+ *                                  component.
+ *  @param[in]      url_length      The length, in bytes, of @a url.
+ *  @param[in,out]  cursor          A pointer to the current parsing
+ *                                  position within @a url at which to
+ *                                  start parsing the path. On
+ *                                  success, this is updated to the
+ *                                  first byte past the parsed path.
+ *  @param[in,out]  path            An optional pointer to storage to
+ *                                  assign a copy of the parsed path
+ *                                  on success.
+ *
+ *  @retval  0        If successful.
+ *  @retavl  -EINVAL  If @a url was null, @a url_length was zero, or @a
+ *                    cursor was null.
+ *
+ *  @sa parse_url_components
+ *
+ */
+static int parse_url_path(const char *url, size_t url_length,
+						const char **cursor,
+						char **path)
+{
+	static char path_delimiter = '/';
+	static const size_t path_delimiter_length = 1;
+	const char *result;
+	size_t remaining_length;
+	size_t path_length = 0;
+
+	if (!url || !url_length || !cursor)
+		return -EINVAL;
+
+	remaining_length = url_length - (size_t)(*cursor - url);
+
+	result = memchr(*cursor, path_delimiter, remaining_length);
+	if (result) {
+		path_length = url_length -
+			(size_t)(result + path_delimiter_length - url);
+
+		if (path)
+			*path = g_strndup(result + path_delimiter_length, path_length);
+
+		*cursor += path_length + path_delimiter_length;
+	} else if (path)
+		*path = NULL;
+
+	return 0;
+}
+
+/**
+ *  @brief
+ *    Attempt to parse the scheme, host, port, and path components
+ *    from a URL.
+ *
+ *  This attempts to parse the scheme, host, port, and path components
+ *  from the specified URL. If provided, the parsed scheme, host and
+ *  path are copied and assigned to @a scheme, @a host, and @a path,
+ *  respective and the parsed port is assigned to @a port.
+ *
+ *  Compliant with RFC 2732, the format of the host component of the
+ *  URL may be one of the following:
+ *
+ *    1. "[\<IPv6 Address>]"
+ *    2. "[\<IPv6 Address>]:<Port>"
+ *    4. "\<IPv4 Address>"
+ *    5. "\<IPv4 Address>:<Port>"
+ *    6. "\<Host Name>"
+ *    7. "\<Host Name>:<Port>"
+ *
+ *  @param[in]      url             A pointer to the immutable null-
+ *                                  terminated C string from which to
+ *                                  parse the scheme, host, port, and
+ *                                  path components.
+ *  @param[in,out]  scheme          An optional pointer to storage to
+ *                                  assign a copy of the parsed scheme
+ *                                  on success.
+ *  @param[in,out]  host            An optional pointer to storage to
+ *                                  assign a copy of the parsed host
+ *                                  on success.
+ *  @param[in,out]  port            An optional pointer to storage to
+ *                                  assign the parsed port on
+ *                                  success. On failure or absence of
+ *                                  a port to parsed, this is assigned
+ *                                  -1.
+ *  @param[in,out]  path            An optional pointer to storage to
+ *                                  assign a copy of the parsed path
+ *                                  on success.
+ *
+ *  @retval  0        If successful.
+ *  @retavl  -EINVAL  If @a url was null, @a url length was zero, if
+ *                    the host portion of @a url is malformed, or if
+ *                    there were no characters to parse after the port
+ *                    delimiter (':').
+ *  @retval  -ERANGE  If the parsed port was outside of the range [0,
+ *                    65535], inclusive.
+ *
+ *  @sa parse_url_scheme_with_default
+ *  @sa parse_url_scheme
+ *  @sa parse_url_host
+ *  @sa parse_url_port
+ *  @sa parse_url_host_and_port
+ *  @sa parse_url_path
+ *
+ */
+static int parse_url_components(const char *url,
+						char **scheme,
+						char **host,
+						int16_t *port,
+						char **path)
+{
+	size_t total_length;
+	const char *p;
+	g_autofree char *temp_scheme = NULL;
+	g_autofree char *temp_host = NULL;
+	int err = 0;
+
+	if (!url)
+		return -EINVAL;
+
+	p = url;
+
+	total_length = strlen(p);
+	if (!total_length)
+		return -EINVAL;
+
+	/* Skip any leading space, if any. */
+
+	while (g_ascii_isspace(*p))
+		p++;
+
+	/* Attempt to handle the scheme component. */
+
+	err = parse_url_scheme(url, total_length, &p, &temp_scheme);
+	if (err != 0)
+		goto done;
+
+	/* Attempt to handle the host component. */
+
+	err = parse_url_host_and_port(url, total_length, &p, &temp_host, port);
+	if (err != 0)
+		goto done;
+
+	/* Attempt to handle the path component. */
+
+	err = parse_url_path(url, total_length, &p, path);
+	if (err != 0)
+		goto done;
+
+	if (scheme)
+		*scheme = g_steal_pointer(&temp_scheme);
+
+	if (host)
+		*host = g_steal_pointer(&temp_host);
+
+done:
+	return err;
+}
+
+/**
+ *	@brief
+ *	  Attempt to parse the request URL for the web request session.
+ *
+ *	This attempts to parse the specified request URL for the specified
+ *	web request session. From the request URL, the scheme is parsed,
+ *	mapped and assigned to the @a session port field and the host and
+ *	path are parsed, copied, and assigned to the host and request
+ *	fields, respectively.
+ *
+ *	Compliant with RFC 2732, the format of the host component of the
+ *	request and proxy URLs may be one of the following:
+ *
+ *	  1. "[\<IPv6 Address>]"
+ *	  2. "[\<IPv6 Address>]:<Port>"
+ *	  4. "\<IPv4 Address>"
+ *	  5. "\<IPv4 Address>:<Port>"
+ *	  6. "\<Host Name>"
+ *	  7. "\<Host Name>:<Port>"
+ *
+ *	@note
+ *	  The caller is responsible for deallocating the memory assigned
+ *	  to the @a session host, request, and address fields.
+ *
+ *	@param[in,out]	session	     A pointer to the mutable web session
+ *							     request object to be populated from
+ *							     @a url and, if provided, @a proxy. On
+ *							     success, the session port, host,
+ *							     request, and address fields will be
+ *							     populated from the parsed request URL.
+ *	@param[in]		request_url  A pointer to the immutable null-
+ *							     terminated C string containing the
+ *							     request URL to parse.
+ *
+ *	@retval	 0		  If successful.
+ *	@retval	 -EINVAL  If @request_url was not a valid URL.
+ *
+ *  @sa parse_url_components
+ *
+ */
+static int parse_request_url(struct web_session *session,
+				const char *request_url, bool has_proxy_url)
+{
+	g_autofree char *scheme = NULL;
+	g_autofree char *host = NULL;
+	g_autofree char *path = NULL;
+	int16_t port = -1;
+	int err = 0;
+
+	if (!session || !request_url)
+		return -EINVAL;
+
+	/* Parse the request URL components. */
+
+	err = parse_url_components(request_url,
+			&scheme,
+			&host,
+			&port,
+			&path);
+	if (err != 0)
+		goto done;
+
+	/*
+	 * Handle the URL scheme, if any, for the session, defaulting to
+	 * the "http" scheme and port 80.
+	 */
+	if (scheme) {
+		if (g_ascii_strcasecmp(scheme, "https") == 0)
+			session->port = 443;
+		else if (g_ascii_strcasecmp(scheme, "http") == 0)
+			session->port = 80;
+		else {
+			err = -EINVAL;
+			goto done;
 		}
+	} else
+		session->port = 80;
 
-		if (!proxy)
+	/* Handle the URL host and port, if any, for the session. */
+
+	if (port != -1) {
+		session->port = port;
+
+		if (!has_proxy_url)
 			session->host = g_strdup(host);
 		else
-			session->host = g_strdup_printf("%s:%u", host, tmp);
+			session->host = g_strdup_printf("%s:%u", host, port);
 	} else
 		session->host = g_strdup(host);
 
-	g_free(scheme);
+	/* Handle the URL path, if any, for the session. */
 
-	if (!proxy)
-		return 0;
+	if (!has_proxy_url)
+		session->request = g_strdup_printf("/%s", path ? path : "");
+	else
+		session->request = g_strdup(request_url);
 
-	scheme = g_strdup(proxy);
-	if (!scheme)
+done:
+	return err;
+}
+
+/**
+ *	@brief
+ *	  Attempt to parse the proxy URL for the web request session.
+ *
+ *	This attempts to parse the specified proxy URL for the specified
+ *	web request session. From the proxy URL, the port component is
+ *	parsed and assigned to the @a session port field and the host
+ *	component is parsed, copied, and assigned to the address field.
+ *
+ *	Compliant with RFC 2732, the format of the host component of the
+ *	request and proxy URLs may be one of the following:
+ *
+ *	  1. "[\<IPv6 Address>]"
+ *	  2. "[\<IPv6 Address>]:<Port>"
+ *	  4. "\<IPv4 Address>"
+ *	  5. "\<IPv4 Address>:<Port>"
+ *	  6. "\<Host Name>"
+ *	  7. "\<Host Name>:<Port>"
+ *
+ *	@note
+ *	  The caller is responsible for deallocating the memory assigned
+ *	  to the @a session address field.
+ *
+ *	@param[in,out]	session	     A pointer to the mutable web session
+ *							     request object to be populated from
+ *							     @a url and, if provided, @a proxy. On
+ *							     success, the session port and address
+ *							     fields will be populated from the
+ *							     parsed proxy URL.
+ *	@param[in]		proxy_url    A pointer to the immutable null-
+ *							     terminated C string containing the
+ *							     web proxy URL to parse.
+ *
+ *	@retval	 0		  If successful.
+ *	@retval	 -EINVAL  If @a proxy_url was not a valid URL.
+ *
+ *  @sa parse_url_scheme
+ *  @sa parse_url_host_and_port
+ *
+ */
+static int parse_proxy_url(struct web_session *session, const char *proxy_url)
+{
+	const char *p;
+	size_t proxy_length;
+	g_autofree char *scheme = NULL;
+	g_autofree char *host = NULL;
+	int16_t port = -1;
+	int err = 0;
+
+	if (!session || !proxy_url)
 		return -EINVAL;
 
-	host = strstr(proxy, "://");
-	if (host) {
-		*host = '\0';
-		host += 3;
+	/*
+	 * Parse the proxy URL scheme, host, and port, the only three
+	 * components we care about.
+	 */
+	p = proxy_url;
+	proxy_length = strlen(p);
 
-		if (strcasecmp(scheme, "http") != 0) {
-			g_free(scheme);
-			return -EINVAL;
-		}
-	} else
-		host = scheme;
+	err = parse_url_scheme(proxy_url,
+			proxy_length,
+			&p,
+			&scheme);
+	if (err != 0)
+		goto done;
 
-	path = strchr(host, '/');
-	if (path)
-		*(path++) = '\0';
+	err = parse_url_host_and_port(proxy_url,
+			proxy_length,
+			&p,
+			&host,
+			&port);
+	if (err != 0)
+		goto done;
 
-	port = strrchr(host, ':');
-	if (port) {
-		char *end;
-		int tmp = strtol(port + 1, &end, 10);
-
-		if (*end == '\0') {
-			*port = '\0';
-			session->port = tmp;
-		}
+	/*
+	 * Handle the proxy URL scheme, if any, for the session. Only
+	 * "http" is allowed.
+	 */
+	if (scheme && g_ascii_strcasecmp(scheme, "http") != 0) {
+		err = -EINVAL;
+		goto done;
 	}
 
-	session->address = g_strdup(host);
+	/*
+	 * Handle the proxy URL host and port for the session.
+	 */
+	if (host)
+		session->address = host;
 
-	g_free(scheme);
+	if (port != -1)
+		session->port = port;
 
-	return 0;
+done:
+	return err;
+}
+
+/**
+ *  @brief
+ *    Attempt to parse the request and proxy URLs for the web request
+ *    session.
+ *
+ *  This attempts to parse the specified request and optional proxy
+ *  URL for the specified web request session. From the request URL,
+ *  the scheme is parsed, mapped and assigned to the @a session port
+ *  field and the host and path are parsed, copied, and assigned to
+ *  the host and request fields, respectively. From the proxy URL, if
+ *  present, the port component is parsed and assigned to the @a
+ *  session port field and the host component is parsed, copied, and
+ *  assigned to the address field.
+ *
+ *  Compliant with RFC 2732, the format of the host component of the
+ *  request and proxy URLs may be one of the following:
+ *
+ *    1. "[\<IPv6 Address>]"
+ *    2. "[\<IPv6 Address>]:<Port>"
+ *    4. "\<IPv4 Address>"
+ *    5. "\<IPv4 Address>:<Port>"
+ *    6. "\<Host Name>"
+ *    7. "\<Host Name>:<Port>"
+ *
+ *  @note
+ *    The caller is responsible for deallocating the memory assigned
+ *    to the @a session host, request, and address fields.
+ *
+ *  @param[in,out]  session  A pointer to the mutable web session request
+ *                           object to be populated from @a url and,
+ *                           if provided, @a proxy. On success, the
+ *                           session port, host, request, and address
+ *                           fields will be populated from the parsed
+ *                           request URL and/or proxy URLs.
+ *  @param[in]      url      A pointer to the immutable null-terminated
+ *                           C string containing the request URL to
+ *                           parse.
+ *  @param[in]      proxy    An optional pointer to the immutable null-
+ *                           terminated C string containing the web
+ *                           proxy URL, if any, to parse.
+ *
+ *  @retval  0         If successful.
+ *  @retval  -EINVAL  If @url was not a valid URL.
+ *
+ *  @sa parse_request_url
+ *  @sa parse_proxy_url
+ *
+ */
+static int parse_request_and_proxy_urls(struct web_session *session,
+				const char *url, const char *proxy)
+{
+	const bool has_proxy_url = (proxy != NULL);
+	int err = 0;
+
+	if (!session || !url)
+		return -EINVAL;
+
+	/* Parse and handle the request URL */
+
+	err = parse_request_url(session, url, has_proxy_url);
+	if (err != 0)
+		goto done;
+
+	if (!has_proxy_url)
+		goto done;
+
+	/* Parse and handle the proxy URL */
+
+	err = parse_proxy_url(session, proxy);
+	if (err != 0)
+		goto done;
+
+done:
+	return err;
 }
 
 static void handle_resolved_address(struct web_session *session)
 {
 	struct addrinfo hints;
-	char *port;
+	g_autofree char *port;
 	int ret;
+	g_autoptr(GError) local_error = NULL;
 
 	debug(session->web, "address %s", session->address);
 
@@ -1223,17 +2516,27 @@ static void handle_resolved_address(struct web_session *session)
 
 	port = g_strdup_printf("%u", session->port);
 	ret = getaddrinfo(session->address, port, &hints, &session->addr);
-	g_free(port);
 	if (ret != 0 || !session->addr) {
-		call_result_func(session, 400);
+		local_error = g_error_new(G_WEB_ERROR,
+			G_WEB_ERROR_HOST_NOT_FOUND,
+			"could not resolve %s: %s",
+			session->address,
+			gai_strerror(ret));
+
+		call_result_func_failure(session, local_error);
+
 		return;
 	}
 
 	call_route_func(session);
 
-	if (create_transport(session) < 0) {
-		call_result_func(session, 409);
-		return;
+	ret = create_transport(session);
+	if (ret < 0) {
+		local_error = g_error_new_literal(G_IO_ERROR,
+						g_io_error_from_errno(ret),
+						g_strerror(ret));
+
+		call_result_func_failure(session, local_error);
 	}
 }
 
@@ -1251,9 +2554,16 @@ static void resolv_result(GResolvResultStatus status,
 					char **results, gpointer user_data)
 {
 	struct web_session *session = user_data;
+	g_autoptr(GError) local_error = NULL;
 
 	if (!results || !results[0]) {
-		call_result_func(session, 404);
+		local_error = g_error_new(G_WEB_ERROR,
+				G_WEB_ERROR_HOST_NOT_FOUND,
+				"could not resolve %s",
+				session->host);
+
+		call_result_func_failure(session, local_error);
+
 		return;
 	}
 
@@ -1283,23 +2593,31 @@ static bool is_ip_address(const char *host)
 static guint do_request(GWeb *web, const char *url,
 				const char *type, GWebInputFunc input,
 				int fd, gsize length, GWebResultFunc func,
-				GWebRouteFunc route, gpointer user_data)
+				GWebRouteFunc route, gpointer user_data,
+				int *err)
 {
 	struct web_session *session;
 	const gchar *host;
+	int request_id = 0;
+	int status = 0;
 
-	if (!web || !url)
-		return 0;
+	if (!web || !url) {
+		status = -EINVAL;
+		goto done;
+	}
 
 	debug(web, "request %s", url);
 
 	session = g_try_new0(struct web_session, 1);
-	if (!session)
-		return 0;
+	if (!session) {
+		status = -ENOMEM;
+		goto done;
+	}
 
-	if (parse_url(session, url, web->proxy) < 0) {
+	status = parse_request_and_proxy_urls(session, url, web->proxy);
+	if (status < 0) {
 		free_session(session);
-		return 0;
+		goto done;
 	}
 
 	debug(web, "proxy host %s", session->address);
@@ -1307,6 +2625,7 @@ static guint do_request(GWeb *web, const char *url,
 	debug(web, "host %s", session->host);
 	debug(web, "flags %lu", session->flags);
 	debug(web, "request %s", session->request);
+	debug(web, "result_func %p", func);
 
 	if (type) {
 		session->content_type = g_strdup(type);
@@ -1327,14 +2646,16 @@ static guint do_request(GWeb *web, const char *url,
 	session->receive_buffer = g_try_malloc(DEFAULT_BUFFER_SIZE);
 	if (!session->receive_buffer) {
 		free_session(session);
-		return 0;
+		status = -ENOMEM;
+		goto done;
 	}
 
 	session->result.headers = g_hash_table_new_full(g_str_hash, g_str_equal,
 							g_free, g_free);
 	if (!session->result.headers) {
 		free_session(session);
-		return 0;
+		status = -ENOMEM;
+		goto done;
 	}
 
 	session->receive_space = DEFAULT_BUFFER_SIZE;
@@ -1353,33 +2674,52 @@ static guint do_request(GWeb *web, const char *url,
 	} else {
 		session->resolv_action = g_resolv_lookup_hostname(web->resolv,
 					host, resolv_result, session);
-		if (session->resolv_action == 0) {
+		if (session->resolv_action <= 0) {
 			free_session(session);
-			return 0;
+			/*
+			 * While the return signature of #g_resolv_lookup_hostname
+			 * is 'guint', it overloads this, treating it as 'int' and
+			 * does potentially return -EIO. Consequently, apply the
+			 * 'int' casts to handle these cases.
+			 */
+			status = (int)session->resolv_action < 0 ?
+						(int)session->resolv_action :
+						-ENOENT;
+			goto done;
 		}
 	}
 
 	web->session_list = g_list_append(web->session_list, session);
 
-	return web->next_query_id++;
+	request_id = web->next_query_id++;
+
+done:
+	if (err)
+		*err = status;
+
+	return request_id;
 }
 
 guint g_web_request_get(GWeb *web, const char *url, GWebResultFunc func,
-		GWebRouteFunc route, gpointer user_data)
+		GWebRouteFunc route, gpointer user_data, int *err)
 {
-	return do_request(web, url, NULL, NULL, -1, 0, func, route, user_data);
+	return do_request(web, url, NULL, NULL, -1, 0,
+		func, route, user_data, err);
 }
 
 guint g_web_request_post(GWeb *web, const char *url,
 				const char *type, GWebInputFunc input,
-				GWebResultFunc func, gpointer user_data)
+				GWebResultFunc func, gpointer user_data,
+				int *err)
 {
-	return do_request(web, url, type, input, -1, 0, func, NULL, user_data);
+	return do_request(web, url, type, input, -1, 0,
+		func, NULL, user_data, err);
 }
 
 guint g_web_request_post_file(GWeb *web, const char *url,
 				const char *type, const char *file,
-				GWebResultFunc func, gpointer user_data)
+				GWebResultFunc func, gpointer user_data,
+				int *err)
 {
 	struct stat st;
 	int fd;
@@ -1393,7 +2733,7 @@ guint g_web_request_post_file(GWeb *web, const char *url,
 		return 0;
 
 	ret = do_request(web, url, type, NULL, fd, st.st_size, func, NULL,
-			user_data);
+			user_data, err);
 	if (ret == 0)
 		close(fd);
 
@@ -1408,10 +2748,23 @@ bool g_web_cancel_request(GWeb *web, guint id)
 	return true;
 }
 
+/**
+ *  @brief
+ *    Returns the HTTP status code, if any, associated with the
+ *    web session request result.
+ *
+ *  @param[in]  result  A pointer to the immutable web session
+ *                      request result for which to return the
+ *                      HTTP status code.
+ *
+ *  @returns
+ *    The HTTP status code.
+ *
+ */
 guint16 g_web_result_get_status(GWebResult *result)
 {
 	if (!result)
-		return 0;
+		return GWEB_HTTP_STATUS_CODE_UNKNOWN;
 
 	return result->status;
 }
@@ -1448,6 +2801,41 @@ bool g_web_result_get_header(GWebResult *result,
 		return false;
 
 	return true;
+}
+
+/**
+ *  @brief
+ *    Return whether the web session request result has any HTTP
+ *    headers.
+ *
+ *  @param[in]  result  A pointer to the immutable web session
+ *                      request result for which to determine if there
+ *                      are any HTTP headers.
+ *  @param[out]  count  An optional pointer to mutable storage for the
+ *                      number of HTTP headers associated with @a
+ *                      result.
+ *
+ *  @returns
+ *    True if there are one or more HTTP headers associated with @a
+ *    result; otherwise, false.
+ *
+ *  @sa g_web_result_get_header
+ *
+ */
+bool g_web_result_has_headers(const GWebResult *result,
+				guint *count)
+{
+	guint size;
+
+	if (!result)
+		return false;
+
+	size = g_hash_table_size(result->headers);
+
+	if (count)
+		*count = size;
+
+	return size > 0;
 }
 
 struct _GWebParser {

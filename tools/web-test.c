@@ -43,7 +43,7 @@ static void sig_term(int sig)
 	g_main_loop_quit(main_loop);
 }
 
-static bool web_result(GWebResult *result, gpointer user_data)
+static bool web_result(const GError *error, GWebResult *result, gpointer user_data)
 {
 	const guint8 *chunk;
 	gsize length;
@@ -150,7 +150,8 @@ int main(int argc, char *argv[])
 
 	timer = g_timer_new();
 
-	if (g_web_request_get(web, argv[1], web_result, NULL,  NULL) == 0) {
+	if (g_web_request_get(web, argv[1], web_result,
+			NULL, NULL, NULL) == 0) {
 		fprintf(stderr, "Failed to start request\n");
 		return 1;
 	}

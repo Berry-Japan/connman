@@ -42,8 +42,8 @@
 
 #include "connman.h"
 
-#ifndef ARPHDR_PHONET_PIPE
-#define ARPHDR_PHONET_PIPE (821)
+#ifndef ARPHRD_PHONET_PIPE
+#define ARPHRD_PHONET_PIPE (821)
 #endif
 
 #define print(arg...) do { if (0) connman_info(arg); } while (0)
@@ -448,7 +448,7 @@ static void process_newlink(unsigned short type, int index, unsigned flags,
 	switch (type) {
 	case ARPHRD_ETHER:
 	case ARPHRD_LOOPBACK:
-	case ARPHDR_PHONET_PIPE:
+	case ARPHRD_PHONET_PIPE:
 	case ARPHRD_PPP:
 	case ARPHRD_NONE:
 		__connman_ipconfig_newlink(index, type, flags,
@@ -536,7 +536,7 @@ static void process_dellink(unsigned short type, int index, unsigned flags,
 	switch (type) {
 	case ARPHRD_ETHER:
 	case ARPHRD_LOOPBACK:
-	case ARPHDR_PHONET_PIPE:
+	case ARPHRD_PHONET_PIPE:
 	case ARPHRD_PPP:
 	case ARPHRD_NONE:
 		__connman_ipconfig_dellink(index, &stats);
@@ -670,7 +670,9 @@ static void process_deladdr(unsigned char family, unsigned char prefixlen,
 
 static void extract_ipv4_route(struct rtmsg *msg, int bytes, int *index,
 						struct in_addr *dst,
-						struct in_addr *gateway)
+						struct in_addr *gateway,
+						uint32_t *table_id,
+						uint32_t *metric)
 {
 	struct rtattr *attr;
 
@@ -689,13 +691,23 @@ static void extract_ipv4_route(struct rtmsg *msg, int bytes, int *index,
 			if (index)
 				*index = *((int *) RTA_DATA(attr));
 			break;
+		case RTA_TABLE:
+			if (table_id)
+				*table_id = *((uint32_t *) RTA_DATA(attr));
+			break;
+		case RTA_PRIORITY:
+			if (metric)
+				*metric = *((uint32_t *) RTA_DATA(attr));
+			break;
 		}
 	}
 }
 
 static void extract_ipv6_route(struct rtmsg *msg, int bytes, int *index,
 						struct in6_addr *dst,
-						struct in6_addr *gateway)
+						struct in6_addr *gateway,
+						uint32_t *table_id,
+						uint32_t *metric)
 {
 	struct rtattr *attr;
 
@@ -715,6 +727,14 @@ static void extract_ipv6_route(struct rtmsg *msg, int bytes, int *index,
 			if (index)
 				*index = *((int *) RTA_DATA(attr));
 			break;
+		case RTA_TABLE:
+			if (table_id)
+				*table_id = *((uint32_t *) RTA_DATA(attr));
+			break;
+		case RTA_PRIORITY:
+			if (metric)
+				*metric = *((uint32_t *) RTA_DATA(attr));
+			break;
 		}
 	}
 }
@@ -725,17 +745,23 @@ static void process_newroute(unsigned char family, unsigned char scope,
 	GSList *list;
 	char dststr[INET6_ADDRSTRLEN], gatewaystr[INET6_ADDRSTRLEN];
 	int index = -1;
+	uint32_t table_id = RT_TABLE_UNSPEC;
+	uint32_t metric = 0;
 
 	if (family == AF_INET) {
 		struct in_addr dst = { INADDR_ANY }, gateway = { INADDR_ANY };
 
-		extract_ipv4_route(msg, bytes, &index, &dst, &gateway);
+		extract_ipv4_route(msg, bytes, &index, &dst, &gateway,
+			&table_id, &metric);
 
 		inet_ntop(family, &dst, dststr, sizeof(dststr));
 		inet_ntop(family, &gateway, gatewaystr, sizeof(gatewaystr));
 
 		__connman_ipconfig_newroute(index, family, scope, dststr,
-								gatewaystr);
+							msg->rtm_dst_len,
+							gatewaystr,
+							table_id,
+							metric);
 
 		/* skip host specific routes */
 		if (scope != RT_SCOPE_UNIVERSE &&
@@ -749,13 +775,17 @@ static void process_newroute(unsigned char family, unsigned char scope,
 		struct in6_addr dst = IN6ADDR_ANY_INIT,
 				gateway = IN6ADDR_ANY_INIT;
 
-		extract_ipv6_route(msg, bytes, &index, &dst, &gateway);
+		extract_ipv6_route(msg, bytes, &index, &dst, &gateway,
+			&table_id, &metric);
 
 		inet_ntop(family, &dst, dststr, sizeof(dststr));
 		inet_ntop(family, &gateway, gatewaystr, sizeof(gatewaystr));
 
 		__connman_ipconfig_newroute(index, family, scope, dststr,
-								gatewaystr);
+							msg->rtm_dst_len,
+							gatewaystr,
+							table_id,
+							metric);
 
 		/* skip host specific routes */
 		if (scope != RT_SCOPE_UNIVERSE &&
@@ -782,17 +812,23 @@ static void process_delroute(unsigned char family, unsigned char scope,
 	GSList *list;
 	char dststr[INET6_ADDRSTRLEN], gatewaystr[INET6_ADDRSTRLEN];
 	int index = -1;
+	uint32_t table_id = RT_TABLE_UNSPEC;
+	uint32_t metric = 0;
 
 	if (family == AF_INET) {
 		struct in_addr dst = { INADDR_ANY }, gateway = { INADDR_ANY };
 
-		extract_ipv4_route(msg, bytes, &index, &dst, &gateway);
+		extract_ipv4_route(msg, bytes, &index, &dst, &gateway,
+			&table_id, &metric);
 
 		inet_ntop(family, &dst, dststr, sizeof(dststr));
 		inet_ntop(family, &gateway, gatewaystr, sizeof(gatewaystr));
 
 		__connman_ipconfig_delroute(index, family, scope, dststr,
-								gatewaystr);
+							msg->rtm_dst_len,
+							gatewaystr,
+							table_id,
+							metric);
 
 		/* skip host specific routes */
 		if (scope != RT_SCOPE_UNIVERSE &&
@@ -806,13 +842,17 @@ static void process_delroute(unsigned char family, unsigned char scope,
 		struct in6_addr dst = IN6ADDR_ANY_INIT,
 				gateway = IN6ADDR_ANY_INIT;
 
-		extract_ipv6_route(msg, bytes, &index, &dst, &gateway);
+		extract_ipv6_route(msg, bytes, &index, &dst, &gateway,
+			&table_id, &metric);
 
 		inet_ntop(family, &dst, dststr, sizeof(dststr));
 		inet_ntop(family, &gateway, gatewaystr, sizeof(gatewaystr));
 
 		__connman_ipconfig_delroute(index, family, scope, dststr,
-						gatewaystr);
+							msg->rtm_dst_len,
+							gatewaystr,
+							table_id,
+							metric);
 
 		/* skip host specific routes */
 		if (scope != RT_SCOPE_UNIVERSE &&
@@ -886,7 +926,7 @@ static inline void print_attr(struct rtattr *attr, const char *name)
 		print("  attr %d (len %d)\n", attr->rta_type, len);
 }
 
-static void rtnl_link(struct nlmsghdr *hdr, bool *has_master)
+static void rtnl_link(struct nlmsghdr *hdr)
 {
 	struct ifinfomsg *msg;
 	struct rtattr *attr;
@@ -928,7 +968,6 @@ static void rtnl_link(struct nlmsghdr *hdr, bool *has_master)
 			print_attr(attr, "priority");
 			break;
 		case IFLA_MASTER:
-			*has_master = true;
 			print_attr(attr, "master");
 			break;
 		case IFLA_WIRELESS:
@@ -961,17 +1000,12 @@ static void rtnl_link(struct nlmsghdr *hdr, bool *has_master)
 
 static void rtnl_newlink(struct nlmsghdr *hdr)
 {
-	bool has_master = false;
 	struct ifinfomsg *msg = (struct ifinfomsg *) NLMSG_DATA(hdr);
 
-	rtnl_link(hdr, &has_master);
+	rtnl_link(hdr);
 
 	if (hdr->nlmsg_type == IFLA_WIRELESS)
 		connman_warn_once("Obsolete WEXT WiFi driver detected");
-
-	/* ignore RTM_NEWLINK when adding interface to bridge */
-	if (has_master)
-		return;
 
 	process_newlink(msg->ifi_type, msg->ifi_index, msg->ifi_flags,
 				msg->ifi_change, msg, IFA_PAYLOAD(hdr));
@@ -979,14 +1013,9 @@ static void rtnl_newlink(struct nlmsghdr *hdr)
 
 static void rtnl_dellink(struct nlmsghdr *hdr)
 {
-	bool has_master = false;
 	struct ifinfomsg *msg = (struct ifinfomsg *) NLMSG_DATA(hdr);
 
-	rtnl_link(hdr, &has_master);
-
-	/* ignore RTM_DELLINK when removing interface from bridge */
-	if (has_master)
-		return;
+	rtnl_link(hdr);
 
 	process_dellink(msg->ifi_type, msg->ifi_index, msg->ifi_flags,
 				msg->ifi_change, msg, IFA_PAYLOAD(hdr));

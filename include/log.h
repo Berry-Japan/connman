@@ -49,6 +49,10 @@ void connman_debug(const char *format, ...)
 	}						\
 } while (0)
 
+/**
+ *  Debug-level logging descriptor that may be used to control debug
+ *  output on a per-file or -symbol basis.
+ */
 struct connman_debug_desc {
 	const char *name;
 	const char *file;
@@ -58,28 +62,89 @@ struct connman_debug_desc {
 	unsigned int flags;
 } __attribute__((aligned(8)));
 
-#define CONNMAN_DEBUG_DEFINE(name) \
-	static struct connman_debug_desc __debug_alias_ ## name \
+/**
+ *  @def CONNMAN_DEBUG_DESC_INSTANTIATE(symbol, _name, _file, _flags)
+ *
+ *  @brief
+ *    Convenience preprocessor macro for declaring and instantiating an
+ *    instance of #connmand_debug_desc.
+ *
+ *  @param[in]  symbol   The name of the #connman_debug_desc instance
+ *                       to instantiate.
+ *  @param[in]  _name    An optional pointer to an immutable null-
+ *                       terminated C string containing the name of
+ *                       the #connman_debug_desc- controlled symbol.
+ *  @param[in]  _file    A pointer to an immutable null-terminated C
+ *                       string containing the name of the
+ *                       #connman_debug_desc-controlled source file.
+ *  @param[in]  _flags   Flags that control the interpretation and
+ *                       behavior of the instantiated
+ *                       #connman_debug_desc instance.
+ *
+ */
+#define CONNMAN_DEBUG_DESC_INSTANTIATE(symbol, _name, _file, _flags) \
+	static struct connman_debug_desc symbol \
 	__attribute__((used, section("__debug"), aligned(8))) = { \
-		#name, __FILE__, CONNMAN_DEBUG_FLAG_ALIAS \
-	};
+		.name = _name, .file = _file, .flags = _flags \
+	}
 
 /**
- * DBG:
- * @fmt: format string
- * @arg...: list of arguments
+ *  @def CONNMAN_DEBUG_ALIAS(suffix)
  *
- * Simple macro around connman_debug() which also include the function
- * name it is called in.
+ *  @brief
+ *    Convenience preprocessor macro for declaring and instantiating
+ *    an alias (see #CONNMAN_DEBUG_FLAG_ALIAS) instance of
+ *    #connmand_debug_desc.
+ *
+ *  @param[in]  suffix  The suffix to concatenate to the name of the
+ *                      #connman_debug_desc alias instance to
+ *                      instantiate.
+ *
+ */
+#define CONNMAN_DEBUG_ALIAS(suffix) \
+	CONNMAN_DEBUG_DESC_INSTANTIATE(__debug_alias_##suffix, \
+		#suffix, \
+		__FILE__, \
+		CONNMAN_DEBUG_FLAG_ALIAS)
+
+/**
+ *  @def DBG(fmt, arg...)
+ *
+ *  @brief
+ *    Convenience preprocessor macro for declaring an instance of
+ *    #connmand_debug_desc for controlling an invocation of
+ *    #connman_debug with it that includes both the file and function
+ *    name the macro was invoked in.
+ *
+ *  This instantiates a scoped-instance of #connmand_debug_desc and
+ *  then, if that instance has its #CONNMAN_DEBUG_FLAG_PRINT flag
+ *  asserted, invokes a call to #connman_debug with the format:
+ *
+ *    "<file>:<function>() <fmt> ..."
+ *
+ *  where <file> is the preprocessor symbol __FILE__, <function> is
+ *  the preprocessor symbol __func__, <fmt> is from @a fmt, and
+ *  '...' is from @a 'arg...'.
+ *
+ *  @param[in]  fmt      A pointer to an immutable null-terminated C
+ *                       string container the log message, consisting
+ *                       of a printf-style format string composed of
+ *                       zero or more output conversion directives.
+ *  @param[in]  arg...   A variadic argument list, where each
+ *                       argument corresponds with its peer output
+ *                       conversion directive in @a fmt.
+ *
+ *  @sa connman_debug
+ *
  */
 #define DBG(fmt, arg...) do { \
-	static struct connman_debug_desc __connman_debug_desc \
-	__attribute__((used, section("__debug"), aligned(8))) = { \
-		.file = __FILE__, .flags = CONNMAN_DEBUG_FLAG_DEFAULT, \
-	}; \
-	if (__connman_debug_desc.flags & CONNMAN_DEBUG_FLAG_PRINT) \
-		connman_debug("%s:%s() " fmt, \
-					__FILE__, __FUNCTION__ , ## arg); \
+	CONNMAN_DEBUG_DESC_INSTANTIATE(__connman_debug_desc, \
+		0, \
+		__FILE__, \
+		CONNMAN_DEBUG_FLAG_DEFAULT); \
+		if (__connman_debug_desc.flags & CONNMAN_DEBUG_FLAG_PRINT) \
+			connman_debug("%s:%s() " fmt, \
+					__FILE__, __func__, ##arg); \
 } while (0)
 
 #ifdef __cplusplus

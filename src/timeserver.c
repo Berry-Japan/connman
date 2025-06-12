@@ -35,6 +35,11 @@
 
 #define TS_RECHECK_INTERVAL     7200
 
+/**
+ *  A strong (that is, uses #connman_service_{ref,unref}) reference to
+ *  the network service currently used for time of day synchronization.
+ *
+ */
 static struct connman_service *ts_service;
 static GSList *timeservers_list = NULL;
 static GSList *ts_list = NULL;
@@ -47,7 +52,7 @@ static GResolv *resolv = NULL;
 static int resolv_id = 0;
 
 static void sync_next(void);
-static void ts_set_nameservers(struct connman_service *service);
+static void ts_set_nameservers(const struct connman_service *service);
 
 static void resolv_debug(const char *str, void *data)
 {
@@ -229,13 +234,13 @@ GSList *__connman_timeserver_add_list(GSList *server_list,
  * list which will be used to determine NTP server for time corrections.
  * The service settings take priority over the global timeservers.
  */
-GSList *__connman_timeserver_get_all(struct connman_service *service)
+GSList *__connman_timeserver_get_all(const struct connman_service *service)
 {
 	GSList *list = NULL;
-	struct connman_network *network;
+	const struct connman_network *network;
 	char **timeservers;
-	char **service_ts;
-	char **service_ts_config;
+	const char * const *service_ts;
+	const char * const *service_ts_config;
 	const char *service_gw;
 	char **fallback_ts;
 	int index, i;
@@ -262,7 +267,7 @@ GSList *__connman_timeserver_get_all(struct connman_service *service)
 	 * configuration option is set to true.
 	 */
 	if (connman_setting_get_bool("UseGatewaysAsTimeservers")) {
-		network = __connman_service_get_network(service);
+		network = __connman_service_get_network((struct connman_service *)service);
 		if (network) {
 			index = connman_network_get_index(network);
 			service_gw = __connman_ipconfig_get_gateway_from_index(index,
@@ -374,7 +379,7 @@ static int ts_setup_resolv(struct connman_service *service)
 }
 
 
-static void ts_set_nameservers(struct connman_service *service)
+static void ts_set_nameservers(const struct connman_service *service)
 {
 	char **nameservers;
 	int i;
@@ -393,8 +398,28 @@ static void ts_set_nameservers(struct connman_service *service)
 	}
 }
 
+/**
+ *  @brief
+ *    Reset internal time of day synchronization state and initiate
+ *    time of day synchronization with the specified network service.
+ *
+ *  @param[in,out]  service  A pointer to the mutable network service
+ *                           object for which a time of day
+ *                           synchronization with time services should
+ *                           be initiated. Name and time servers from
+ *                           this service will be used for time of day
+ *                           synchronization.
+ *
+ *  @sa __connman_timeserver_sync
+ *  @sa __connman_timeserver_conf_update
+ *  @sa __connman_timeserver_system_set
+ *
+ */
 static void ts_reset(struct connman_service *service)
 {
+	DBG("service %p (%s)",
+		service, connman_service_get_identifier(service));
+
 	if (!resolv)
 		return;
 
@@ -427,13 +452,58 @@ static void ts_reset(struct connman_service *service)
 
 	ts_recheck_enable();
 
-	ts_service = service;
+	if (ts_service) {
+		connman_service_unref(ts_service);
+		ts_service = NULL;
+	}
+
+	if (service) {
+		connman_service_ref(service);
+		ts_service = service;
+	}
+
 	timeserver_sync_start();
 }
 
+static const char *timeserver_sync_reason2string(
+			enum connman_timeserver_sync_reason reason)
+{
+	switch (reason) {
+	case CONNMAN_TIMESERVER_SYNC_REASON_START:
+		return "start";
+	case CONNMAN_TIMESERVER_SYNC_REASON_ADDRESS_UPDATE:
+		return "address update";
+	case CONNMAN_TIMESERVER_SYNC_REASON_STATE_UPDATE:
+		return "state update";
+	case CONNMAN_TIMESERVER_SYNC_REASON_TS_CHANGE:
+		return "timeserver change";
+	}
+
+	return "unknown";
+}
+
+/**
+ *  @brief
+ *    Initiate a time of day synchronization with time services.
+ *
+ *  This initiates a time of day synchronization with time services
+ *  for the specified network service for the provided reason.
+ *
+ *  @param[in,out]  service  A pointer to the mutable network service
+ *                           object for which a time of day
+ *                           synchronization with time services should
+ *                           be initiated.
+ *  @param[in]      reason   The reason for the time of day
+ *                           synchronizization request.
+ *
+ */
 void __connman_timeserver_sync(struct connman_service *service,
 			enum connman_timeserver_sync_reason reason)
 {
+	DBG("service %p (%s) reason %d (%s)",
+		service, connman_service_get_identifier(service),
+		reason, timeserver_sync_reason2string(reason));
+
 	if (!service)
 		return;
 
@@ -506,7 +576,10 @@ static void timeserver_stop(void)
 {
 	DBG(" ");
 
-	ts_service = NULL;
+	if (ts_service) {
+		connman_service_unref(ts_service);
+		ts_service = NULL;
+	}
 
 	if (resolv) {
 		g_resolv_unref(resolv);

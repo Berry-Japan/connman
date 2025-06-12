@@ -71,15 +71,23 @@ enum connman_service_state {
 };
 
 enum connman_service_error {
-	CONNMAN_SERVICE_ERROR_UNKNOWN        = 0,
-	CONNMAN_SERVICE_ERROR_OUT_OF_RANGE   = 1,
-	CONNMAN_SERVICE_ERROR_PIN_MISSING    = 2,
-	CONNMAN_SERVICE_ERROR_DHCP_FAILED    = 3,
-	CONNMAN_SERVICE_ERROR_CONNECT_FAILED = 4,
-	CONNMAN_SERVICE_ERROR_LOGIN_FAILED  = 5,
-	CONNMAN_SERVICE_ERROR_AUTH_FAILED    = 6,
-	CONNMAN_SERVICE_ERROR_INVALID_KEY    = 7,
-	CONNMAN_SERVICE_ERROR_BLOCKED        = 8,
+	CONNMAN_SERVICE_ERROR_UNKNOWN             = 0,
+	CONNMAN_SERVICE_ERROR_OUT_OF_RANGE        = 1,
+	CONNMAN_SERVICE_ERROR_PIN_MISSING         = 2,
+	CONNMAN_SERVICE_ERROR_DHCP_FAILED         = 3,
+	CONNMAN_SERVICE_ERROR_CONNECT_FAILED      = 4,
+	CONNMAN_SERVICE_ERROR_LOGIN_FAILED        = 5,
+	CONNMAN_SERVICE_ERROR_AUTH_FAILED         = 6,
+	CONNMAN_SERVICE_ERROR_INVALID_KEY         = 7,
+	CONNMAN_SERVICE_ERROR_BLOCKED             = 8,
+
+	/**
+	 *	In "continuous" online check mode,
+	 *	the back-to-back online check
+	 *	failures threshold was met or
+	 *	exceeded.
+	 */
+	CONNMAN_SERVICE_ERROR_ONLINE_CHECK_FAILED = 9,
 };
 
 enum connman_service_proxy_method {
@@ -114,24 +122,24 @@ connman_service_ref_debug(struct connman_service *service,
 void connman_service_unref_debug(struct connman_service *service,
 			const char *file, int line, const char *caller);
 
-enum connman_service_type connman_service_get_type(struct connman_service *service);
-enum connman_service_state connman_service_get_state(struct connman_service *service);
-char *connman_service_get_interface(struct connman_service *service);
+enum connman_service_type connman_service_get_type(const struct connman_service *service);
+enum connman_service_state connman_service_get_state(const struct connman_service *service);
+char *connman_service_get_interface(const struct connman_service *service);
 
-const char *connman_service_get_identifier(struct connman_service *service);
-const char *connman_service_get_domainname(struct connman_service *service);
-const char *connman_service_get_dbuspath(struct connman_service *service);
-char **connman_service_get_nameservers(struct connman_service *service);
-char **connman_service_get_timeservers_config(struct connman_service *service);
-char **connman_service_get_timeservers(struct connman_service *service);
+const char *connman_service_get_identifier(const struct connman_service *service);
+const char *connman_service_get_domainname(const struct connman_service *service);
+const char *connman_service_get_dbuspath(const struct connman_service *service);
+char **connman_service_get_nameservers(const struct connman_service *service);
+const char * const *connman_service_get_timeservers_config(const struct connman_service *service);
+const char * const *connman_service_get_timeservers(const struct connman_service *service);
 void connman_service_set_proxy_method(struct connman_service *service, enum connman_service_proxy_method method);
-enum connman_service_proxy_method connman_service_get_proxy_method(struct connman_service *service);
+enum connman_service_proxy_method connman_service_get_proxy_method(const struct connman_service *service);
 char **connman_service_get_proxy_servers(struct connman_service *service);
 char **connman_service_get_proxy_excludes(struct connman_service *service);
-const char *connman_service_get_proxy_url(struct connman_service *service);
+const char *connman_service_get_proxy_url(const struct connman_service *service);
 const char *connman_service_get_proxy_autoconfig(struct connman_service *service);
-bool connman_service_get_favorite(struct connman_service *service);
-bool connman_service_get_autoconnect(struct connman_service *service);
+bool connman_service_get_favorite(const struct connman_service *service);
+bool connman_service_get_autoconnect(const struct connman_service *service);
 bool connman_service_set_autoconnect(struct connman_service *service,
 							bool autoconnect);
 

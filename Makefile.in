@@ -204,8 +204,7 @@ TESTS = unit/test-ippool$(EXEEXT) $(am__EXEEXT_10)
 @TOOLS_TRUE@am__append_98 = tools/supplicant-test \
 @TOOLS_TRUE@			tools/dhcp-test tools/dhcp-server-test \
 @TOOLS_TRUE@			tools/addr-test tools/web-test tools/resolv-test \
-@TOOLS_TRUE@			tools/dbus-test tools/polkit-test \
-@TOOLS_TRUE@			tools/tap-test tools/wpad-test \
+@TOOLS_TRUE@			tools/dbus-test tools/polkit-test tools/wpad-test \
 @TOOLS_TRUE@			tools/stats-tool tools/private-network-test \
 @TOOLS_TRUE@			tools/session-test \
 @TOOLS_TRUE@			tools/dnsproxy-test
@@ -254,7 +253,7 @@ am__installdirs = "$(DESTDIR)$(bindir)" "$(DESTDIR)$(sbindir)" \
 @TOOLS_TRUE@	tools/addr-test$(EXEEXT) tools/web-test$(EXEEXT) \
 @TOOLS_TRUE@	tools/resolv-test$(EXEEXT) \
 @TOOLS_TRUE@	tools/dbus-test$(EXEEXT) \
-@TOOLS_TRUE@	tools/polkit-test$(EXEEXT) tools/tap-test$(EXEEXT) \
+@TOOLS_TRUE@	tools/polkit-test$(EXEEXT) \
 @TOOLS_TRUE@	tools/wpad-test$(EXEEXT) tools/stats-tool$(EXEEXT) \
 @TOOLS_TRUE@	tools/private-network-test$(EXEEXT) \
 @TOOLS_TRUE@	tools/session-test$(EXEEXT) \
@@ -471,7 +470,7 @@ am__src_connmand_SOURCES_DIST = gdhcp/gdhcp.h gdhcp/common.h \
 	src/shared/util.h src/shared/util.c src/shared/arp.h \
 	src/shared/arp.c src/connman.ver src/main.c src/connman.h \
 	src/log.c src/error.c src/plugin.c src/task.c src/device.c \
-	src/network.c src/connection.c src/manager.c src/service.c \
+	src/network.c src/gateway.c src/manager.c src/service.c \
 	src/clock.c src/timezone.c src/agent-connman.c src/agent.c \
 	src/notifier.c src/provider.c src/resolver.c src/ipconfig.c \
 	src/detect.c src/inet.c src/dhcp.c src/dhcpv6.c src/rtnl.c \
@@ -539,9 +538,9 @@ am_src_connmand_OBJECTS = $(am__objects_1) $(am__objects_4) \
 	src/connmand-log.$(OBJEXT) src/connmand-error.$(OBJEXT) \
 	src/connmand-plugin.$(OBJEXT) src/connmand-task.$(OBJEXT) \
 	src/connmand-device.$(OBJEXT) src/connmand-network.$(OBJEXT) \
-	src/connmand-connection.$(OBJEXT) \
-	src/connmand-manager.$(OBJEXT) src/connmand-service.$(OBJEXT) \
-	src/connmand-clock.$(OBJEXT) src/connmand-timezone.$(OBJEXT) \
+	src/connmand-gateway.$(OBJEXT) src/connmand-manager.$(OBJEXT) \
+	src/connmand-service.$(OBJEXT) src/connmand-clock.$(OBJEXT) \
+	src/connmand-timezone.$(OBJEXT) \
 	src/connmand-agent-connman.$(OBJEXT) \
 	src/connmand-agent.$(OBJEXT) src/connmand-notifier.$(OBJEXT) \
 	src/connmand-provider.$(OBJEXT) \
@@ -626,7 +625,7 @@ am__tools_dnsproxy_standalone_SOURCES_DIST =  \
 	src/shared/util.h src/shared/util.c src/shared/arp.h \
 	src/shared/arp.c src/connman.ver src/main.c src/connman.h \
 	src/log.c src/error.c src/plugin.c src/task.c src/device.c \
-	src/network.c src/connection.c src/manager.c src/service.c \
+	src/network.c src/gateway.c src/manager.c src/service.c \
 	src/clock.c src/timezone.c src/agent-connman.c src/agent.c \
 	src/notifier.c src/provider.c src/resolver.c src/ipconfig.c \
 	src/detect.c src/inet.c src/dhcp.c src/dhcpv6.c src/rtnl.c \
@@ -698,7 +697,7 @@ am__objects_61 = $(am__objects_32) $(am__objects_35) $(am__objects_36) \
 	src/tools_dnsproxy_standalone-task.$(OBJEXT) \
 	src/tools_dnsproxy_standalone-device.$(OBJEXT) \
 	src/tools_dnsproxy_standalone-network.$(OBJEXT) \
-	src/tools_dnsproxy_standalone-connection.$(OBJEXT) \
+	src/tools_dnsproxy_standalone-gateway.$(OBJEXT) \
 	src/tools_dnsproxy_standalone-manager.$(OBJEXT) \
 	src/tools_dnsproxy_standalone-service.$(OBJEXT) \
 	src/tools_dnsproxy_standalone-clock.$(OBJEXT) \
@@ -832,9 +831,6 @@ am__tools_supplicant_test_SOURCES_DIST = tools/supplicant-test.c \
 tools_supplicant_test_OBJECTS = $(am_tools_supplicant_test_OBJECTS)
 @TOOLS_TRUE@tools_supplicant_test_DEPENDENCIES =  \
 @TOOLS_TRUE@	gdbus/libgdbus-internal.la
-tools_tap_test_SOURCES = tools/tap-test.c
-tools_tap_test_OBJECTS = tools/tap-test.$(OBJEXT)
-tools_tap_test_LDADD = $(LDADD)
 am__tools_web_test_SOURCES_DIST = gweb/gweb.h gweb/gweb.c \
 	gweb/gresolv.h gweb/gresolv.c gweb/giognutls.h \
 	gweb/giognutls.c gweb/gionotls.c tools/web-test.c
@@ -1050,7 +1046,6 @@ am__depfiles_remade = client/$(DEPDIR)/agent.Po \
 	src/$(DEPDIR)/connmand-bridge.Po \
 	src/$(DEPDIR)/connmand-clock.Po \
 	src/$(DEPDIR)/connmand-config.Po \
-	src/$(DEPDIR)/connmand-connection.Po \
 	src/$(DEPDIR)/connmand-counter.Po \
 	src/$(DEPDIR)/connmand-dbus.Po \
 	src/$(DEPDIR)/connmand-detect.Po \
@@ -1062,6 +1057,7 @@ am__depfiles_remade = client/$(DEPDIR)/agent.Po \
 	src/$(DEPDIR)/connmand-error.Po \
 	src/$(DEPDIR)/connmand-firewall-iptables.Po \
 	src/$(DEPDIR)/connmand-firewall-nftables.Po \
+	src/$(DEPDIR)/connmand-gateway.Po \
 	src/$(DEPDIR)/connmand-inet.Po \
 	src/$(DEPDIR)/connmand-inotify.Po \
 	src/$(DEPDIR)/connmand-ipaddress.Po \
@@ -1108,7 +1104,6 @@ am__depfiles_remade = client/$(DEPDIR)/agent.Po \
 	src/$(DEPDIR)/tools_dnsproxy_standalone-bridge.Po \
 	src/$(DEPDIR)/tools_dnsproxy_standalone-clock.Po \
 	src/$(DEPDIR)/tools_dnsproxy_standalone-config.Po \
-	src/$(DEPDIR)/tools_dnsproxy_standalone-connection.Po \
 	src/$(DEPDIR)/tools_dnsproxy_standalone-counter.Po \
 	src/$(DEPDIR)/tools_dnsproxy_standalone-dbus.Po \
 	src/$(DEPDIR)/tools_dnsproxy_standalone-detect.Po \
@@ -1120,6 +1115,7 @@ am__depfiles_remade = client/$(DEPDIR)/agent.Po \
 	src/$(DEPDIR)/tools_dnsproxy_standalone-error.Po \
 	src/$(DEPDIR)/tools_dnsproxy_standalone-firewall-iptables.Po \
 	src/$(DEPDIR)/tools_dnsproxy_standalone-firewall-nftables.Po \
+	src/$(DEPDIR)/tools_dnsproxy_standalone-gateway.Po \
 	src/$(DEPDIR)/tools_dnsproxy_standalone-inet.Po \
 	src/$(DEPDIR)/tools_dnsproxy_standalone-inotify.Po \
 	src/$(DEPDIR)/tools_dnsproxy_standalone-ipaddress.Po \
@@ -1197,9 +1193,9 @@ am__depfiles_remade = client/$(DEPDIR)/agent.Po \
 	tools/$(DEPDIR)/session-utils.Po tools/$(DEPDIR)/stats-tool.Po \
 	tools/$(DEPDIR)/supplicant-dbus.Po \
 	tools/$(DEPDIR)/supplicant-test.Po \
-	tools/$(DEPDIR)/supplicant.Po tools/$(DEPDIR)/tap-test.Po \
-	tools/$(DEPDIR)/web-test.Po tools/$(DEPDIR)/wispr.Po \
-	tools/$(DEPDIR)/wpad-test.Po unit/$(DEPDIR)/test-ippool.Po \
+	tools/$(DEPDIR)/supplicant.Po tools/$(DEPDIR)/web-test.Po \
+	tools/$(DEPDIR)/wispr.Po tools/$(DEPDIR)/wpad-test.Po \
+	unit/$(DEPDIR)/test-ippool.Po \
 	unit/$(DEPDIR)/test_iptables-test-iptables.Po \
 	vpn/$(DEPDIR)/connman_vpnd-main.Po \
 	vpn/$(DEPDIR)/connman_vpnd-vpn-agent.Po \
@@ -1263,10 +1259,9 @@ SOURCES = $(gdbus_libgdbus_internal_la_SOURCES) \
 	tools/polkit-test.c tools/private-network-test.c \
 	$(tools_resolv_test_SOURCES) $(tools_session_test_SOURCES) \
 	tools/stats-tool.c $(tools_supplicant_test_SOURCES) \
-	tools/tap-test.c $(tools_web_test_SOURCES) \
-	$(tools_wispr_SOURCES) $(tools_wpad_test_SOURCES) \
-	$(unit_test_ippool_SOURCES) $(unit_test_iptables_SOURCES) \
-	$(vpn_connman_vpnd_SOURCES)
+	$(tools_web_test_SOURCES) $(tools_wispr_SOURCES) \
+	$(tools_wpad_test_SOURCES) $(unit_test_ippool_SOURCES) \
+	$(unit_test_iptables_SOURCES) $(vpn_connman_vpnd_SOURCES)
 DIST_SOURCES = $(gdbus_libgdbus_internal_la_SOURCES) \
 	plugins/hh2serial-gps.c plugins/iospm.c \
 	plugins/session_policy_local.c plugins/tist.c \
@@ -1291,7 +1286,7 @@ DIST_SOURCES = $(gdbus_libgdbus_internal_la_SOURCES) \
 	tools/private-network-test.c \
 	$(am__tools_resolv_test_SOURCES_DIST) \
 	$(am__tools_session_test_SOURCES_DIST) tools/stats-tool.c \
-	$(am__tools_supplicant_test_SOURCES_DIST) tools/tap-test.c \
+	$(am__tools_supplicant_test_SOURCES_DIST) \
 	$(am__tools_web_test_SOURCES_DIST) \
 	$(am__tools_wispr_SOURCES_DIST) \
 	$(am__tools_wpad_test_SOURCES_DIST) \
@@ -1492,7 +1487,6 @@ RECHECK_LOGS = $(TEST_LOGS)
 @TOOLS_TRUE@@XTABLES_TRUE@am__EXEEXT_10 = unit/test-iptables$(EXEEXT)
 TEST_SUITE_LOG = test-suite.log
 TEST_EXTENSIONS = @EXEEXT@ .test
-LOG_DRIVER = $(SHELL) $(top_srcdir)/test-driver
 LOG_COMPILE = $(LOG_COMPILER) $(AM_LOG_FLAGS) $(LOG_FLAGS)
 am__set_b = \
   case '$@' in \
@@ -1514,7 +1508,7 @@ am__DIST_COMMON = $(srcdir)/Makefile.in $(srcdir)/Makefile.plugins \
 	$(srcdir)/config.h.in $(srcdir)/connman.pc.in \
 	$(top_srcdir)/include/version.h.in AUTHORS COPYING ChangeLog \
 	INSTALL NEWS README TODO compile config.guess config.sub \
-	depcomp install-sh ltmain.sh missing test-driver
+	depcomp install-sh ltmain.sh missing tap-driver.sh test-driver
 DISTFILES = $(DIST_COMMON) $(DIST_SOURCES) $(TEXINFOS) $(EXTRA_DIST)
 distdir = $(PACKAGE)-$(VERSION)
 top_distdir = $(distdir)
@@ -1566,6 +1560,8 @@ ETAGS = @ETAGS@
 EXEEXT = @EXEEXT@
 FGREP = @FGREP@
 FILECMD = @FILECMD@
+GIO_CFLAGS = @GIO_CFLAGS@
+GIO_LIBS = @GIO_LIBS@
 GLIB_CFLAGS = @GLIB_CFLAGS@
 GLIB_LIBS = @GLIB_LIBS@
 GNUTLS_CFLAGS = @GNUTLS_CFLAGS@
@@ -1771,7 +1767,7 @@ src_connmand_SOURCES = $(gdhcp_sources) $(gweb_sources) \
 	$(stats_sources) $(backtrace_sources) $(builtin_sources) \
 	$(shared_sources) src/connman.ver src/main.c src/connman.h \
 	src/log.c src/error.c src/plugin.c src/task.c src/device.c \
-	src/network.c src/connection.c src/manager.c src/service.c \
+	src/network.c src/gateway.c src/manager.c src/service.c \
 	src/clock.c src/timezone.c src/agent-connman.c src/agent.c \
 	src/notifier.c src/provider.c src/resolver.c src/ipconfig.c \
 	src/detect.c src/inet.c src/dhcp.c src/dhcpv6.c src/rtnl.c \
@@ -1784,8 +1780,8 @@ src_connmand_SOURCES = $(gdhcp_sources) $(gweb_sources) \
 	src/acd.c $(am__append_5) $(am__append_6) $(am__append_7) \
 	$(am__append_9)
 src_connmand_LDADD = gdbus/libgdbus-internal.la $(builtin_libadd) \
-	@GLIB_LIBS@ @DBUS_LIBS@ @GNUTLS_LIBS@ -lresolv -ldl -lrt \
-	$(am__append_8) $(am__append_10)
+	@GIO_LIBS@ @GLIB_LIBS@ @DBUS_LIBS@ @GNUTLS_LIBS@ -lresolv -ldl \
+	-lrt $(am__append_8) $(am__append_10)
 src_connmand_LDFLAGS = -Wl,--export-dynamic \
 				-Wl,--version-script=$(srcdir)/src/connman.ver
 
@@ -1820,7 +1816,7 @@ src_connmand_wait_online_LDADD = gdbus/libgdbus-internal.la \
 @VPN_TRUE@			vpn/vpn-config.c vpn/vpn-settings.c vpn/vpn-util.c
 
 @VPN_TRUE@vpn_connman_vpnd_LDADD = gdbus/libgdbus-internal.la $(builtin_vpn_libadd) \
-@VPN_TRUE@				@GLIB_LIBS@ @DBUS_LIBS@ @GNUTLS_LIBS@ \
+@VPN_TRUE@				@GIO_LIBS@ @GLIB_LIBS@ @DBUS_LIBS@ @GNUTLS_LIBS@ \
 @VPN_TRUE@				-lresolv -ldl
 
 @VPN_TRUE@vpn_connman_vpnd_LDFLAGS = -Wl,--export-dynamic \
@@ -1886,7 +1882,7 @@ EXTRA_DIST = src/genbuiltin src/connman-dbus.conf \
 	doc/connman-vpn-provider.config.5.in doc/connman.8.in \
 	doc/connman-vpn.8.in src/main.conf src/eduroam.config \
 	scripts/connman_resolvconf.conf.in $(am__append_103) \
-	vpn/connman-task.te
+	vpn/connman-task.te scripts/libppp-compat.h
 @VPN_TRUE@vpn_connman_vpnd_CFLAGS = @DBUS_CFLAGS@ @GLIB_CFLAGS@ \
 @VPN_TRUE@				$(builtin_vpn_cflags) \
 @VPN_TRUE@				-DCONNMAN_PLUGIN_BUILTIN \
@@ -2000,8 +1996,11 @@ unit_test_ippool_SOURCES = $(backtrace_sources) src/log.c src/dbus.c \
 unit_test_ippool_LDADD = gdbus/libgdbus-internal.la \
 				@GLIB_LIBS@ @DBUS_LIBS@ -ldl
 
+LOG_DRIVER = env AM_TAP_AWK='$(AWK)' $(SHELL) \
+			$(top_srcdir)/tap-driver.sh
+
 @WISPR_TRUE@tools_wispr_SOURCES = $(gweb_sources) tools/wispr.c
-@WISPR_TRUE@tools_wispr_LDADD = @GLIB_LIBS@ @GNUTLS_LIBS@ -lresolv
+@WISPR_TRUE@tools_wispr_LDADD = @GIO_LIBS@ @GLIB_LIBS@ @GNUTLS_LIBS@ -lresolv
 @TOOLS_TRUE@tools_supplicant_test_SOURCES = tools/supplicant-test.c \
 @TOOLS_TRUE@			tools/supplicant-dbus.h tools/supplicant-dbus.c \
 @TOOLS_TRUE@			tools/supplicant.h tools/supplicant.c
@@ -2010,7 +2009,7 @@ unit_test_ippool_LDADD = gdbus/libgdbus-internal.la \
 @TOOLS_TRUE@				@GLIB_LIBS@ @DBUS_LIBS@
 
 @TOOLS_TRUE@tools_web_test_SOURCES = $(gweb_sources) tools/web-test.c
-@TOOLS_TRUE@tools_web_test_LDADD = @GLIB_LIBS@ @GNUTLS_LIBS@ -lresolv
+@TOOLS_TRUE@tools_web_test_LDADD = @GIO_LIBS@ @GLIB_LIBS@ @GNUTLS_LIBS@ -lresolv
 @TOOLS_TRUE@tools_resolv_test_SOURCES = gweb/gresolv.h gweb/gresolv.c tools/resolv-test.c
 @TOOLS_TRUE@tools_resolv_test_LDADD = @GLIB_LIBS@ -lresolv
 @TOOLS_TRUE@tools_wpad_test_SOURCES = gweb/gresolv.h gweb/gresolv.c tools/wpad-test.c
@@ -2060,7 +2059,7 @@ unit_test_ippool_LDADD = gdbus/libgdbus-internal.la \
 
 @TOOLS_TRUE@@XTABLES_TRUE@unit_test_iptables_LDADD = @GLIB_LIBS@ -ldl
 @TOOLS_TRUE@tools_dnsproxy_test_SOURCES = tools/dnsproxy-test.c
-@TOOLS_TRUE@tools_dnsproxy_test_LDADD = @GLIB_LIBS@
+@TOOLS_TRUE@tools_dnsproxy_test_LDADD = @GIO_LIBS@ @GLIB_LIBS@
 test_scripts = test/get-state test/list-services test/monitor-services \
 	test/test-clock test/simple-agent test/show-introspection \
 	test/test-compat test/test-manager test/test-connman \
@@ -2097,7 +2096,7 @@ DISTCHECK_CONFIGURE_FLAGS = --disable-datafiles \
 
 DISTCLEANFILES = $(pkgconfig_DATA)
 MAINTAINERCLEANFILES = Makefile.in \
-	aclocal.m4 configure config.h.in config.sub config.guess \
+	aclocal.m4 configure config.h.in config.sub config.guess tap-driver.sh \
 	ltmain.sh depcomp compile missing install-sh mkinstalldirs test-driver
 
 do_subst = $(AM_V_GEN)$(SED) \
@@ -2678,7 +2677,7 @@ src/connmand-device.$(OBJEXT): src/$(am__dirstamp) \
 	src/$(DEPDIR)/$(am__dirstamp)
 src/connmand-network.$(OBJEXT): src/$(am__dirstamp) \
 	src/$(DEPDIR)/$(am__dirstamp)
-src/connmand-connection.$(OBJEXT): src/$(am__dirstamp) \
+src/connmand-gateway.$(OBJEXT): src/$(am__dirstamp) \
 	src/$(DEPDIR)/$(am__dirstamp)
 src/connmand-manager.$(OBJEXT): src/$(am__dirstamp) \
 	src/$(DEPDIR)/$(am__dirstamp)
@@ -2905,8 +2904,8 @@ src/tools_dnsproxy_standalone-device.$(OBJEXT): src/$(am__dirstamp) \
 	src/$(DEPDIR)/$(am__dirstamp)
 src/tools_dnsproxy_standalone-network.$(OBJEXT): src/$(am__dirstamp) \
 	src/$(DEPDIR)/$(am__dirstamp)
-src/tools_dnsproxy_standalone-connection.$(OBJEXT):  \
-	src/$(am__dirstamp) src/$(DEPDIR)/$(am__dirstamp)
+src/tools_dnsproxy_standalone-gateway.$(OBJEXT): src/$(am__dirstamp) \
+	src/$(DEPDIR)/$(am__dirstamp)
 src/tools_dnsproxy_standalone-manager.$(OBJEXT): src/$(am__dirstamp) \
 	src/$(DEPDIR)/$(am__dirstamp)
 src/tools_dnsproxy_standalone-service.$(OBJEXT): src/$(am__dirstamp) \
@@ -3089,12 +3088,6 @@ tools/supplicant.$(OBJEXT): tools/$(am__dirstamp) \
 tools/supplicant-test$(EXEEXT): $(tools_supplicant_test_OBJECTS) $(tools_supplicant_test_DEPENDENCIES) $(EXTRA_tools_supplicant_test_DEPENDENCIES) tools/$(am__dirstamp)
 	@rm -f tools/supplicant-test$(EXEEXT)
 	$(AM_V_CCLD)$(LINK) $(tools_supplicant_test_OBJECTS) $(tools_supplicant_test_LDADD) $(LIBS)
-tools/tap-test.$(OBJEXT): tools/$(am__dirstamp) \
-	tools/$(DEPDIR)/$(am__dirstamp)
-
-tools/tap-test$(EXEEXT): $(tools_tap_test_OBJECTS) $(tools_tap_test_DEPENDENCIES) $(EXTRA_tools_tap_test_DEPENDENCIES) tools/$(am__dirstamp)
-	@rm -f tools/tap-test$(EXEEXT)
-	$(AM_V_CCLD)$(LINK) $(tools_tap_test_OBJECTS) $(tools_tap_test_LDADD) $(LIBS)
 gweb/gweb.$(OBJEXT): gweb/$(am__dirstamp) \
 	gweb/$(DEPDIR)/$(am__dirstamp)
 gweb/giognutls.$(OBJEXT): gweb/$(am__dirstamp) \
@@ -3377,7 +3370,6 @@ distclean-compile:
 @AMDEP_TRUE@@am__include@ @am__quote@src/$(DEPDIR)/connmand-bridge.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@src/$(DEPDIR)/connmand-clock.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@src/$(DEPDIR)/connmand-config.Po@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@src/$(DEPDIR)/connmand-connection.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@src/$(DEPDIR)/connmand-counter.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@src/$(DEPDIR)/connmand-dbus.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@src/$(DEPDIR)/connmand-detect.Po@am__quote@ # am--include-marker
@@ -3389,6 +3381,7 @@ distclean-compile:
 @AMDEP_TRUE@@am__include@ @am__quote@src/$(DEPDIR)/connmand-error.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@src/$(DEPDIR)/connmand-firewall-iptables.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@src/$(DEPDIR)/connmand-firewall-nftables.Po@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@src/$(DEPDIR)/connmand-gateway.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@src/$(DEPDIR)/connmand-inet.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@src/$(DEPDIR)/connmand-inotify.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@src/$(DEPDIR)/connmand-ipaddress.Po@am__quote@ # am--include-marker
@@ -3441,7 +3434,6 @@ distclean-compile:
 @AMDEP_TRUE@@am__include@ @am__quote@src/$(DEPDIR)/tools_dnsproxy_standalone-bridge.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@src/$(DEPDIR)/tools_dnsproxy_standalone-clock.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@src/$(DEPDIR)/tools_dnsproxy_standalone-config.Po@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@src/$(DEPDIR)/tools_dnsproxy_standalone-connection.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@src/$(DEPDIR)/tools_dnsproxy_standalone-counter.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@src/$(DEPDIR)/tools_dnsproxy_standalone-dbus.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@src/$(DEPDIR)/tools_dnsproxy_standalone-detect.Po@am__quote@ # am--include-marker
@@ -3453,6 +3445,7 @@ distclean-compile:
 @AMDEP_TRUE@@am__include@ @am__quote@src/$(DEPDIR)/tools_dnsproxy_standalone-error.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@src/$(DEPDIR)/tools_dnsproxy_standalone-firewall-iptables.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@src/$(DEPDIR)/tools_dnsproxy_standalone-firewall-nftables.Po@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@src/$(DEPDIR)/tools_dnsproxy_standalone-gateway.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@src/$(DEPDIR)/tools_dnsproxy_standalone-inet.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@src/$(DEPDIR)/tools_dnsproxy_standalone-inotify.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@src/$(DEPDIR)/tools_dnsproxy_standalone-ipaddress.Po@am__quote@ # am--include-marker
@@ -3537,7 +3530,6 @@ distclean-compile:
 @AMDEP_TRUE@@am__include@ @am__quote@tools/$(DEPDIR)/supplicant-dbus.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@tools/$(DEPDIR)/supplicant-test.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@tools/$(DEPDIR)/supplicant.Po@am__quote@ # am--include-marker
-@AMDEP_TRUE@@am__include@ @am__quote@tools/$(DEPDIR)/tap-test.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@tools/$(DEPDIR)/web-test.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@tools/$(DEPDIR)/wispr.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@tools/$(DEPDIR)/wpad-test.Po@am__quote@ # am--include-marker
@@ -4200,19 +4192,19 @@ src/connmand-network.obj: src/network.c
 @AMDEP_TRUE@@am__fastdepCC_FALSE@	DEPDIR=$(DEPDIR) $(CCDEPMODE) $(depcomp) @AMDEPBACKSLASH@
 @am__fastdepCC_FALSE@	$(AM_V_CC@am__nodep@)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(src_connmand_CFLAGS) $(CFLAGS) -c -o src/connmand-network.obj `if test -f 'src/network.c'; then $(CYGPATH_W) 'src/network.c'; else $(CYGPATH_W) '$(srcdir)/src/network.c'; fi`
 
-src/connmand-connection.o: src/connection.c
-@am__fastdepCC_TRUE@	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(src_connmand_CFLAGS) $(CFLAGS) -MT src/connmand-connection.o -MD -MP -MF src/$(DEPDIR)/connmand-connection.Tpo -c -o src/connmand-connection.o `test -f 'src/connection.c' || echo '$(srcdir)/'`src/connection.c
-@am__fastdepCC_TRUE@	$(AM_V_at)$(am__mv) src/$(DEPDIR)/connmand-connection.Tpo src/$(DEPDIR)/connmand-connection.Po
-@AMDEP_TRUE@@am__fastdepCC_FALSE@	$(AM_V_CC)source='src/connection.c' object='src/connmand-connection.o' libtool=no @AMDEPBACKSLASH@
+src/connmand-gateway.o: src/gateway.c
+@am__fastdepCC_TRUE@	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(src_connmand_CFLAGS) $(CFLAGS) -MT src/connmand-gateway.o -MD -MP -MF src/$(DEPDIR)/connmand-gateway.Tpo -c -o src/connmand-gateway.o `test -f 'src/gateway.c' || echo '$(srcdir)/'`src/gateway.c
+@am__fastdepCC_TRUE@	$(AM_V_at)$(am__mv) src/$(DEPDIR)/connmand-gateway.Tpo src/$(DEPDIR)/connmand-gateway.Po
+@AMDEP_TRUE@@am__fastdepCC_FALSE@	$(AM_V_CC)source='src/gateway.c' object='src/connmand-gateway.o' libtool=no @AMDEPBACKSLASH@
 @AMDEP_TRUE@@am__fastdepCC_FALSE@	DEPDIR=$(DEPDIR) $(CCDEPMODE) $(depcomp) @AMDEPBACKSLASH@
-@am__fastdepCC_FALSE@	$(AM_V_CC@am__nodep@)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(src_connmand_CFLAGS) $(CFLAGS) -c -o src/connmand-connection.o `test -f 'src/connection.c' || echo '$(srcdir)/'`src/connection.c
+@am__fastdepCC_FALSE@	$(AM_V_CC@am__nodep@)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(src_connmand_CFLAGS) $(CFLAGS) -c -o src/connmand-gateway.o `test -f 'src/gateway.c' || echo '$(srcdir)/'`src/gateway.c
 
-src/connmand-connection.obj: src/connection.c
-@am__fastdepCC_TRUE@	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(src_connmand_CFLAGS) $(CFLAGS) -MT src/connmand-connection.obj -MD -MP -MF src/$(DEPDIR)/connmand-connection.Tpo -c -o src/connmand-connection.obj `if test -f 'src/connection.c'; then $(CYGPATH_W) 'src/connection.c'; else $(CYGPATH_W) '$(srcdir)/src/connection.c'; fi`
-@am__fastdepCC_TRUE@	$(AM_V_at)$(am__mv) src/$(DEPDIR)/connmand-connection.Tpo src/$(DEPDIR)/connmand-connection.Po
-@AMDEP_TRUE@@am__fastdepCC_FALSE@	$(AM_V_CC)source='src/connection.c' object='src/connmand-connection.obj' libtool=no @AMDEPBACKSLASH@
+src/connmand-gateway.obj: src/gateway.c
+@am__fastdepCC_TRUE@	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(src_connmand_CFLAGS) $(CFLAGS) -MT src/connmand-gateway.obj -MD -MP -MF src/$(DEPDIR)/connmand-gateway.Tpo -c -o src/connmand-gateway.obj `if test -f 'src/gateway.c'; then $(CYGPATH_W) 'src/gateway.c'; else $(CYGPATH_W) '$(srcdir)/src/gateway.c'; fi`
+@am__fastdepCC_TRUE@	$(AM_V_at)$(am__mv) src/$(DEPDIR)/connmand-gateway.Tpo src/$(DEPDIR)/connmand-gateway.Po
+@AMDEP_TRUE@@am__fastdepCC_FALSE@	$(AM_V_CC)source='src/gateway.c' object='src/connmand-gateway.obj' libtool=no @AMDEPBACKSLASH@
 @AMDEP_TRUE@@am__fastdepCC_FALSE@	DEPDIR=$(DEPDIR) $(CCDEPMODE) $(depcomp) @AMDEPBACKSLASH@
-@am__fastdepCC_FALSE@	$(AM_V_CC@am__nodep@)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(src_connmand_CFLAGS) $(CFLAGS) -c -o src/connmand-connection.obj `if test -f 'src/connection.c'; then $(CYGPATH_W) 'src/connection.c'; else $(CYGPATH_W) '$(srcdir)/src/connection.c'; fi`
+@am__fastdepCC_FALSE@	$(AM_V_CC@am__nodep@)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(src_connmand_CFLAGS) $(CFLAGS) -c -o src/connmand-gateway.obj `if test -f 'src/gateway.c'; then $(CYGPATH_W) 'src/gateway.c'; else $(CYGPATH_W) '$(srcdir)/src/gateway.c'; fi`
 
 src/connmand-manager.o: src/manager.c
 @am__fastdepCC_TRUE@	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(src_connmand_CFLAGS) $(CFLAGS) -MT src/connmand-manager.o -MD -MP -MF src/$(DEPDIR)/connmand-manager.Tpo -c -o src/connmand-manager.o `test -f 'src/manager.c' || echo '$(srcdir)/'`src/manager.c
@@ -5390,19 +5382,19 @@ src/tools_dnsproxy_standalone-network.obj: src/network.c
 @AMDEP_TRUE@@am__fastdepCC_FALSE@	DEPDIR=$(DEPDIR) $(CCDEPMODE) $(depcomp) @AMDEPBACKSLASH@
 @am__fastdepCC_FALSE@	$(AM_V_CC@am__nodep@)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(tools_dnsproxy_standalone_CFLAGS) $(CFLAGS) -c -o src/tools_dnsproxy_standalone-network.obj `if test -f 'src/network.c'; then $(CYGPATH_W) 'src/network.c'; else $(CYGPATH_W) '$(srcdir)/src/network.c'; fi`
 
-src/tools_dnsproxy_standalone-connection.o: src/connection.c
-@am__fastdepCC_TRUE@	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(tools_dnsproxy_standalone_CFLAGS) $(CFLAGS) -MT src/tools_dnsproxy_standalone-connection.o -MD -MP -MF src/$(DEPDIR)/tools_dnsproxy_standalone-connection.Tpo -c -o src/tools_dnsproxy_standalone-connection.o `test -f 'src/connection.c' || echo '$(srcdir)/'`src/connection.c
-@am__fastdepCC_TRUE@	$(AM_V_at)$(am__mv) src/$(DEPDIR)/tools_dnsproxy_standalone-connection.Tpo src/$(DEPDIR)/tools_dnsproxy_standalone-connection.Po
-@AMDEP_TRUE@@am__fastdepCC_FALSE@	$(AM_V_CC)source='src/connection.c' object='src/tools_dnsproxy_standalone-connection.o' libtool=no @AMDEPBACKSLASH@
+src/tools_dnsproxy_standalone-gateway.o: src/gateway.c
+@am__fastdepCC_TRUE@	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(tools_dnsproxy_standalone_CFLAGS) $(CFLAGS) -MT src/tools_dnsproxy_standalone-gateway.o -MD -MP -MF src/$(DEPDIR)/tools_dnsproxy_standalone-gateway.Tpo -c -o src/tools_dnsproxy_standalone-gateway.o `test -f 'src/gateway.c' || echo '$(srcdir)/'`src/gateway.c
+@am__fastdepCC_TRUE@	$(AM_V_at)$(am__mv) src/$(DEPDIR)/tools_dnsproxy_standalone-gateway.Tpo src/$(DEPDIR)/tools_dnsproxy_standalone-gateway.Po
+@AMDEP_TRUE@@am__fastdepCC_FALSE@	$(AM_V_CC)source='src/gateway.c' object='src/tools_dnsproxy_standalone-gateway.o' libtool=no @AMDEPBACKSLASH@
 @AMDEP_TRUE@@am__fastdepCC_FALSE@	DEPDIR=$(DEPDIR) $(CCDEPMODE) $(depcomp) @AMDEPBACKSLASH@
-@am__fastdepCC_FALSE@	$(AM_V_CC@am__nodep@)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(tools_dnsproxy_standalone_CFLAGS) $(CFLAGS) -c -o src/tools_dnsproxy_standalone-connection.o `test -f 'src/connection.c' || echo '$(srcdir)/'`src/connection.c
+@am__fastdepCC_FALSE@	$(AM_V_CC@am__nodep@)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(tools_dnsproxy_standalone_CFLAGS) $(CFLAGS) -c -o src/tools_dnsproxy_standalone-gateway.o `test -f 'src/gateway.c' || echo '$(srcdir)/'`src/gateway.c
 
-src/tools_dnsproxy_standalone-connection.obj: src/connection.c
-@am__fastdepCC_TRUE@	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(tools_dnsproxy_standalone_CFLAGS) $(CFLAGS) -MT src/tools_dnsproxy_standalone-connection.obj -MD -MP -MF src/$(DEPDIR)/tools_dnsproxy_standalone-connection.Tpo -c -o src/tools_dnsproxy_standalone-connection.obj `if test -f 'src/connection.c'; then $(CYGPATH_W) 'src/connection.c'; else $(CYGPATH_W) '$(srcdir)/src/connection.c'; fi`
-@am__fastdepCC_TRUE@	$(AM_V_at)$(am__mv) src/$(DEPDIR)/tools_dnsproxy_standalone-connection.Tpo src/$(DEPDIR)/tools_dnsproxy_standalone-connection.Po
-@AMDEP_TRUE@@am__fastdepCC_FALSE@	$(AM_V_CC)source='src/connection.c' object='src/tools_dnsproxy_standalone-connection.obj' libtool=no @AMDEPBACKSLASH@
+src/tools_dnsproxy_standalone-gateway.obj: src/gateway.c
+@am__fastdepCC_TRUE@	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(tools_dnsproxy_standalone_CFLAGS) $(CFLAGS) -MT src/tools_dnsproxy_standalone-gateway.obj -MD -MP -MF src/$(DEPDIR)/tools_dnsproxy_standalone-gateway.Tpo -c -o src/tools_dnsproxy_standalone-gateway.obj `if test -f 'src/gateway.c'; then $(CYGPATH_W) 'src/gateway.c'; else $(CYGPATH_W) '$(srcdir)/src/gateway.c'; fi`
+@am__fastdepCC_TRUE@	$(AM_V_at)$(am__mv) src/$(DEPDIR)/tools_dnsproxy_standalone-gateway.Tpo src/$(DEPDIR)/tools_dnsproxy_standalone-gateway.Po
+@AMDEP_TRUE@@am__fastdepCC_FALSE@	$(AM_V_CC)source='src/gateway.c' object='src/tools_dnsproxy_standalone-gateway.obj' libtool=no @AMDEPBACKSLASH@
 @AMDEP_TRUE@@am__fastdepCC_FALSE@	DEPDIR=$(DEPDIR) $(CCDEPMODE) $(depcomp) @AMDEPBACKSLASH@
-@am__fastdepCC_FALSE@	$(AM_V_CC@am__nodep@)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(tools_dnsproxy_standalone_CFLAGS) $(CFLAGS) -c -o src/tools_dnsproxy_standalone-connection.obj `if test -f 'src/connection.c'; then $(CYGPATH_W) 'src/connection.c'; else $(CYGPATH_W) '$(srcdir)/src/connection.c'; fi`
+@am__fastdepCC_FALSE@	$(AM_V_CC@am__nodep@)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(tools_dnsproxy_standalone_CFLAGS) $(CFLAGS) -c -o src/tools_dnsproxy_standalone-gateway.obj `if test -f 'src/gateway.c'; then $(CYGPATH_W) 'src/gateway.c'; else $(CYGPATH_W) '$(srcdir)/src/gateway.c'; fi`
 
 src/tools_dnsproxy_standalone-manager.o: src/manager.c
 @am__fastdepCC_TRUE@	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(tools_dnsproxy_standalone_CFLAGS) $(CFLAGS) -MT src/tools_dnsproxy_standalone-manager.o -MD -MP -MF src/$(DEPDIR)/tools_dnsproxy_standalone-manager.Tpo -c -o src/tools_dnsproxy_standalone-manager.o `test -f 'src/manager.c' || echo '$(srcdir)/'`src/manager.c
@@ -7563,7 +7555,6 @@ distclean: distclean-am
 	-rm -f src/$(DEPDIR)/connmand-bridge.Po
 	-rm -f src/$(DEPDIR)/connmand-clock.Po
 	-rm -f src/$(DEPDIR)/connmand-config.Po
-	-rm -f src/$(DEPDIR)/connmand-connection.Po
 	-rm -f src/$(DEPDIR)/connmand-counter.Po
 	-rm -f src/$(DEPDIR)/connmand-dbus.Po
 	-rm -f src/$(DEPDIR)/connmand-detect.Po
@@ -7575,6 +7566,7 @@ distclean: distclean-am
 	-rm -f src/$(DEPDIR)/connmand-error.Po
 	-rm -f src/$(DEPDIR)/connmand-firewall-iptables.Po
 	-rm -f src/$(DEPDIR)/connmand-firewall-nftables.Po
+	-rm -f src/$(DEPDIR)/connmand-gateway.Po
 	-rm -f src/$(DEPDIR)/connmand-inet.Po
 	-rm -f src/$(DEPDIR)/connmand-inotify.Po
 	-rm -f src/$(DEPDIR)/connmand-ipaddress.Po
@@ -7627,7 +7619,6 @@ distclean: distclean-am
 	-rm -f src/$(DEPDIR)/tools_dnsproxy_standalone-bridge.Po
 	-rm -f src/$(DEPDIR)/tools_dnsproxy_standalone-clock.Po
 	-rm -f src/$(DEPDIR)/tools_dnsproxy_standalone-config.Po
-	-rm -f src/$(DEPDIR)/tools_dnsproxy_standalone-connection.Po
 	-rm -f src/$(DEPDIR)/tools_dnsproxy_standalone-counter.Po
 	-rm -f src/$(DEPDIR)/tools_dnsproxy_standalone-dbus.Po
 	-rm -f src/$(DEPDIR)/tools_dnsproxy_standalone-detect.Po
@@ -7639,6 +7630,7 @@ distclean: distclean-am
 	-rm -f src/$(DEPDIR)/tools_dnsproxy_standalone-error.Po
 	-rm -f src/$(DEPDIR)/tools_dnsproxy_standalone-firewall-iptables.Po
 	-rm -f src/$(DEPDIR)/tools_dnsproxy_standalone-firewall-nftables.Po
+	-rm -f src/$(DEPDIR)/tools_dnsproxy_standalone-gateway.Po
 	-rm -f src/$(DEPDIR)/tools_dnsproxy_standalone-inet.Po
 	-rm -f src/$(DEPDIR)/tools_dnsproxy_standalone-inotify.Po
 	-rm -f src/$(DEPDIR)/tools_dnsproxy_standalone-ipaddress.Po
@@ -7723,7 +7715,6 @@ distclean: distclean-am
 	-rm -f tools/$(DEPDIR)/supplicant-dbus.Po
 	-rm -f tools/$(DEPDIR)/supplicant-test.Po
 	-rm -f tools/$(DEPDIR)/supplicant.Po
-	-rm -f tools/$(DEPDIR)/tap-test.Po
 	-rm -f tools/$(DEPDIR)/web-test.Po
 	-rm -f tools/$(DEPDIR)/wispr.Po
 	-rm -f tools/$(DEPDIR)/wpad-test.Po
@@ -7898,7 +7889,6 @@ maintainer-clean: maintainer-clean-am
 	-rm -f src/$(DEPDIR)/connmand-bridge.Po
 	-rm -f src/$(DEPDIR)/connmand-clock.Po
 	-rm -f src/$(DEPDIR)/connmand-config.Po
-	-rm -f src/$(DEPDIR)/connmand-connection.Po
 	-rm -f src/$(DEPDIR)/connmand-counter.Po
 	-rm -f src/$(DEPDIR)/connmand-dbus.Po
 	-rm -f src/$(DEPDIR)/connmand-detect.Po
@@ -7910,6 +7900,7 @@ maintainer-clean: maintainer-clean-am
 	-rm -f src/$(DEPDIR)/connmand-error.Po
 	-rm -f src/$(DEPDIR)/connmand-firewall-iptables.Po
 	-rm -f src/$(DEPDIR)/connmand-firewall-nftables.Po
+	-rm -f src/$(DEPDIR)/connmand-gateway.Po
 	-rm -f src/$(DEPDIR)/connmand-inet.Po
 	-rm -f src/$(DEPDIR)/connmand-inotify.Po
 	-rm -f src/$(DEPDIR)/connmand-ipaddress.Po
@@ -7962,7 +7953,6 @@ maintainer-clean: maintainer-clean-am
 	-rm -f src/$(DEPDIR)/tools_dnsproxy_standalone-bridge.Po
 	-rm -f src/$(DEPDIR)/tools_dnsproxy_standalone-clock.Po
 	-rm -f src/$(DEPDIR)/tools_dnsproxy_standalone-config.Po
-	-rm -f src/$(DEPDIR)/tools_dnsproxy_standalone-connection.Po
 	-rm -f src/$(DEPDIR)/tools_dnsproxy_standalone-counter.Po
 	-rm -f src/$(DEPDIR)/tools_dnsproxy_standalone-dbus.Po
 	-rm -f src/$(DEPDIR)/tools_dnsproxy_standalone-detect.Po
@@ -7974,6 +7964,7 @@ maintainer-clean: maintainer-clean-am
 	-rm -f src/$(DEPDIR)/tools_dnsproxy_standalone-error.Po
 	-rm -f src/$(DEPDIR)/tools_dnsproxy_standalone-firewall-iptables.Po
 	-rm -f src/$(DEPDIR)/tools_dnsproxy_standalone-firewall-nftables.Po
+	-rm -f src/$(DEPDIR)/tools_dnsproxy_standalone-gateway.Po
 	-rm -f src/$(DEPDIR)/tools_dnsproxy_standalone-inet.Po
 	-rm -f src/$(DEPDIR)/tools_dnsproxy_standalone-inotify.Po
 	-rm -f src/$(DEPDIR)/tools_dnsproxy_standalone-ipaddress.Po
@@ -8058,7 +8049,6 @@ maintainer-clean: maintainer-clean-am
 	-rm -f tools/$(DEPDIR)/supplicant-dbus.Po
 	-rm -f tools/$(DEPDIR)/supplicant-test.Po
 	-rm -f tools/$(DEPDIR)/supplicant.Po
-	-rm -f tools/$(DEPDIR)/tap-test.Po
 	-rm -f tools/$(DEPDIR)/web-test.Po
 	-rm -f tools/$(DEPDIR)/wispr.Po
 	-rm -f tools/$(DEPDIR)/wpad-test.Po

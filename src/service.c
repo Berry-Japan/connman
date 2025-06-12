@@ -45,6 +45,24 @@
 #define VPN_AUTOCONNECT_TIMEOUT_STEP 30
 #define VPN_AUTOCONNECT_TIMEOUT_ATTEMPTS_THRESHOLD 270
 
+/*
+ * There are many call sites throughout this module for these
+ * functions. These are macros to help, during debugging, to acertain
+ * where they were called from.
+ */
+
+#define DEFAULT_CHANGED() \
+	default_changed(__func__)
+
+#define SERVICE_LIST_SORT() \
+	service_list_sort(__func__)
+
+typedef guint (*online_check_timeout_compute_t)(unsigned int interval);
+typedef bool (*is_counter_threshold_met_predicate_t)(
+	const struct connman_service *service,
+	const char *counter_description,
+	unsigned int counter_threshold);
+
 static DBusConnection *connection = NULL;
 
 static GList *service_list = NULL;
@@ -53,11 +71,23 @@ static GHashTable *passphrase_requested = NULL;
 static GSList *counter_list = NULL;
 static unsigned int autoconnect_id = 0;
 static unsigned int vpn_autoconnect_id = 0;
+/**
+ *  A weak reference to the current default service (that is, has the
+ *  default route) used to compare against another service when the
+ *  default service has potentially changed.
+ *
+ *  @sa connman_service_get_default
+ *  @sa connman_service_is_default
+ *  @sa default_changed
+ *
+ */
 static struct connman_service *current_default = NULL;
 static bool services_dirty = false;
-static bool enable_online_to_ready_transition = false;
+static unsigned int online_check_connect_timeout_ms = 0;
 static unsigned int online_check_initial_interval = 0;
 static unsigned int online_check_max_interval = 0;
+static const char *online_check_timeout_interval_style = NULL;
+static online_check_timeout_compute_t online_check_timeout_compute_func = NULL;
 
 struct connman_stats {
 	bool valid;
@@ -71,6 +101,42 @@ struct connman_stats_counter {
 	bool append_all;
 	struct connman_stats stats;
 	struct connman_stats stats_roaming;
+};
+
+/**
+ *  IP configuration type-specific "online" HTTP-based Internet
+ *  reachability check state.
+ *
+ */
+struct online_check_state {
+	/**
+	 *  Indicates whether an online check is active and in-flight.
+	 */
+	bool active;
+
+	/**
+	 *  The current GLib main loop timer identifier.
+	 *
+	 */
+	guint timeout;
+
+	/**
+	 *  The current "online" reachability check sequence interval.
+	 *
+	 */
+	unsigned int interval;
+
+	/**
+	 *	The number of sustained, back-to-back "online" reachability
+	 *	check successes for "continuous" online check mode.
+	 */
+	unsigned int successes;
+
+	/**
+	 *	The number of sustained, back-to-back "online" reachability
+	 *	check failures for "continuous" online check mode.
+	 */
+	unsigned int failures;
 };
 
 struct connman_service {
@@ -125,7 +191,6 @@ struct connman_service {
 	char *private_key_passphrase;
 	char *phase2;
 	DBusMessage *pending;
-	DBusMessage *provider_pending;
 	guint timeout;
 	struct connman_stats stats;
 	struct connman_stats stats_roaming;
@@ -137,10 +202,23 @@ struct connman_service {
 	char *pac;
 	bool wps;
 	bool wps_advertizing;
-	guint online_timeout_ipv4;
-	guint online_timeout_ipv6;
-	unsigned int online_check_interval_ipv4;
-	unsigned int online_check_interval_ipv6;
+
+    /**
+     *  IPv4-specific "online" reachability check state.
+     */
+	struct online_check_state online_check_state_ipv4;
+
+    /**
+     *  IPv6-specific "online" reachability check state.
+     */
+	struct online_check_state online_check_state_ipv6;
+
+    /**
+     *  Tracks whether the service has met the number of sustained,
+     *  back-to-back "online" reachability check failures for
+     *  "continuous" online check mode.
+     */
+	bool online_check_failures_met_threshold;
 	bool do_split_routing;
 	bool new_service;
 	bool hidden_service;
@@ -155,8 +233,21 @@ static struct connman_ipconfig *create_ip4config(struct connman_service *service
 static struct connman_ipconfig *create_ip6config(struct connman_service *service,
 		int index);
 static void dns_changed(struct connman_service *service);
+static void proxy_changed(struct connman_service *service);
 static void vpn_auto_connect(void);
 static void trigger_autoconnect(struct connman_service *service);
+static void service_list_sort(const char *function);
+static void complete_online_check(struct connman_service *service,
+					enum connman_ipconfig_type type,
+					bool success,
+					int err,
+					const char *message);
+static bool service_downgrade_online_state(struct connman_service *service);
+static bool connman_service_is_default(const struct connman_service *service);
+static int start_online_check_if_connected(struct connman_service *service);
+static void set_error(struct connman_service *service,
+					enum connman_service_error error);
+static void clear_error(struct connman_service *service);
 
 struct find_data {
 	const char *path;
@@ -342,6 +433,8 @@ static const char *error2string(enum connman_service_error error)
 		return "invalid-key";
 	case CONNMAN_SERVICE_ERROR_BLOCKED:
 		return "blocked";
+	case CONNMAN_SERVICE_ERROR_ONLINE_CHECK_FAILED:
+		return "online-check-failed";
 	}
 
 	return NULL;
@@ -462,6 +555,84 @@ int __connman_service_load_modifiable(struct connman_service *service)
 	g_key_file_free(keyfile);
 
 	return 0;
+}
+
+/**
+ *  @brief
+ *    Log the proxy auto-configuration (PAC) URL associated with the
+ *    specified service.
+ *
+ *  @param[in]  service  A pointer to the immutable network
+ *                       service for which to log the proxy
+ *                       auto-configuration (PAC) URL.
+ *  @param[in]  url      An optional pointer to the immutable null-
+ *                       terminated C string containing the proxy
+ *                       auto-configuration (PAC) URL.
+ *
+ *  @private
+ *
+ */
+static void service_log_pac(const struct connman_service *service,
+				const char *url)
+{
+	g_autofree char *interface = NULL;
+
+	interface = connman_service_get_interface(service);
+
+	connman_info("Interface %s [ %s ] proxy auto-configuration (PAC) URL %s.",
+				 interface,
+				 __connman_service_type2string(service->type),
+				 url ? url : "is not set");
+}
+
+/**
+ *  @brief
+ *    Set and log the proxy auto-configuration (PAC) URL for the
+ *    specified service.
+ *
+ *  If the specified service is a hidden service, no set or log
+ *  actions are taken.
+ *
+ *  @param[in,out]  service    A pointer to the mutable network
+ *                             service for which to set the proxy
+ *                             auto-configuration (PAC) URL.
+ *  @param[in]      url        An pointer to the immutable null-
+ *                             terminated C string containing the proxy
+ *                             auto-configuration (PAC) URL to set.
+ *  @param[in]      dochanged  A Boolean indicating whether or a D-Bus
+ *                             change notification should be sent for
+ *                             the service "Proxy" property.
+ *
+ *  @sa proxy_changed
+ *  @sa service_log_pac
+ *
+ *  @private
+ *
+ */
+static void service_set_pac(struct connman_service *service,
+				const char *pac,
+				bool dochanged)
+{
+	DBG("service %p (%s) pac %p (%s) dochanged %u",
+		service, connman_service_get_identifier(service),
+		pac,
+		pac ? pac : "<null>",
+		dochanged);
+
+	if (service->hidden)
+		return;
+
+	service_log_pac(service, pac);
+
+	g_free(service->pac);
+
+	if (pac && strlen(pac) > 0)
+		service->pac = g_strstrip(g_strdup(pac));
+	else
+		service->pac = NULL;
+
+	if (dochanged)
+		proxy_changed(service);
 }
 
 static int service_load(struct connman_service *service)
@@ -638,10 +809,10 @@ static int service_load(struct connman_service *service)
 
 	str = g_key_file_get_string(keyfile,
 				service->identifier, "Proxy.URL", NULL);
-	if (str) {
-		g_free(service->pac);
-		service->pac = str;
-	}
+	if (str)
+		service_set_pac(service, str, false);
+
+	g_free(str);
 
 	service->mdns_config = g_key_file_get_boolean(keyfile,
 				service->identifier, "mDNS", NULL);
@@ -663,7 +834,9 @@ static int service_save(struct connman_service *service)
 	const char *cst_str = NULL;
 	int err = 0;
 
-	DBG("service %p new %d", service, service->new_service);
+	DBG("service %p (%s) new %d",
+		service, connman_service_get_identifier(service),
+		service->new_service);
 
 	if (service->new_service)
 		return -ESRCH;
@@ -965,6 +1138,11 @@ static bool is_connected(enum connman_service_state state)
 	return false;
 }
 
+static bool is_online(enum connman_service_state state)
+{
+	return state == CONNMAN_SERVICE_STATE_ONLINE;
+}
+
 static bool is_idle(enum connman_service_state state)
 {
 	switch (state) {
@@ -1184,7 +1362,9 @@ int __connman_service_nameserver_append(struct connman_service *service,
 	char **nameservers;
 	int len, i;
 
-	DBG("service %p nameserver %s auto %d",	service, nameserver, is_auto);
+	DBG("service %p (%s) nameserver %s auto %d",
+		service, connman_service_get_identifier(service),
+		nameserver, is_auto);
 
 	if (!nameserver)
 		return -EINVAL;
@@ -1303,9 +1483,38 @@ void __connman_service_nameserver_clear(struct connman_service *service)
 	nameserver_add_all(service, CONNMAN_IPCONFIG_TYPE_ALL);
 }
 
-static void add_nameserver_route(int family, int index, char *nameserver,
+/**
+ *  @brief
+ *    Add an IPv4 or IPv6 host route for the specified domain name
+ *    service (DNS) server.
+ *
+ *  This attempts to add an IPv4 or IPv6 host route for the specified
+ *  domain name service (DNS) server with the specified attributes.
+ *
+ *  @param[in]  family      The address family describing the
+ *                          address pointed to by @a nameserver.
+ *  @param[in]  index       The network interface index associated
+ *                          with the output network device for
+ *                          the route.
+ *  @param[in]  nameserver  A pointer to an immutable null-terminated
+ *                          C string containing the IPv4 or IPv6
+ *                          address, in text form, of the route
+ *                          DNS server destination address.
+ *  @param[in]  gw          A pointer to an immutable null-terminated
+ *                          C string containing the IPv4 or IPv6
+ *                          address, in text form, of the route next
+ *                          hop gateway address.
+ *
+ *  @sa del_nameserver_route
+ *  @sa nameserver_add_routes
+ *
+ */
+static void add_nameserver_route(int family, int index, const char *nameserver,
 				const char *gw)
 {
+	DBG("family %d index %d nameserver %s gw %s",
+		family, index, nameserver, gw);
+
 	switch (family) {
 	case AF_INET:
 		if (connman_inet_compare_subnet(index, nameserver))
@@ -1325,6 +1534,92 @@ static void add_nameserver_route(int family, int index, char *nameserver,
 	}
 }
 
+/**
+ *  @brief
+ *    Delete an IPv4 or IPv6 host route for the specified domain name
+ *    service (DNS) server.
+ *
+ *  This attempts to delete an IPv4 or IPv6 host route for the
+ *  specified domain name service (DNS) server with the specified
+ *  attributes.
+ *
+ *  @param[in]  family      The address family describing the
+ *                          address pointed to by @a nameserver.
+ *  @param[in]  index       The network interface index associated
+ *                          with the output network device for
+ *                          the route.
+ *  @param[in]  nameserver  A pointer to an immutable null-terminated
+ *                          C string containing the IPv4 or IPv6
+ *                          address, in text form, of the route
+ *                          DNS server destination address.
+ *  @param[in]  gw          A pointer to an immutable null-terminated
+ *                          C string containing the IPv4 or IPv6
+ *                          address, in text form, of the route next
+ *                          hop gateway address.
+ *
+ *  @sa add_nameserver_route
+ *  @sa nameserver_del_routes
+ *
+ */
+static void del_nameserver_route(int family, int index, const char *nameserver,
+				const char *gw,
+				enum connman_ipconfig_type type)
+{
+	DBG("family %d index %d nameserver %s gw %s",
+		family, index, nameserver, gw);
+
+	switch (family) {
+	case AF_INET:
+		if (type != CONNMAN_IPCONFIG_TYPE_IPV4 &&
+			type != CONNMAN_IPCONFIG_TYPE_ALL)
+			break;
+
+		if (connman_inet_compare_subnet(index, nameserver))
+			break;
+
+		if (connman_inet_del_host_route(index, nameserver, gw) < 0)
+			/* For P-t-P link the above route del will fail */
+			connman_inet_del_host_route(index, nameserver, NULL);
+		break;
+
+	case AF_INET6:
+		if (type != CONNMAN_IPCONFIG_TYPE_IPV6 &&
+			type != CONNMAN_IPCONFIG_TYPE_ALL)
+			break;
+
+		if (connman_inet_del_ipv6_host_route(index, nameserver,
+								gw) < 0)
+			connman_inet_del_ipv6_host_route(index, nameserver,
+							NULL);
+		break;
+	}
+}
+
+/**
+ *  @brief
+ *    Add IPv4 or IPv6 host routes for the specified domain name
+ *    service (DNS) servers.
+ *
+ *  This attempts to add IPv4 or IPv6 host routes for the specified
+ *  domain name service (DNS) servers with the specified attributes.
+ *
+ *  @param[in]  index        The network interface index associated
+ *                           with the output network device for
+ *                           the route.
+ *  @param[in]  nameservers  A pointer to a null-terminated array of
+ *                           mutable null-terminated C strings
+ *                           containing the IPv4 or IPv6 addresses, in
+ *                           text form, of the route DNS server
+ *                           destination addresses.
+ *  @param[in]  gw           A pointer to an immutable null-terminated
+ *                           C string containing the IPv4 or IPv6
+ *                           address, in text form, of the route next
+ *                           hop gateway address.
+ *
+ *  @sa add_nameserver_route
+ *  @sa nameserver_del_routes
+ *
+ */
 static void nameserver_add_routes(int index, char **nameservers,
 					const char *gw)
 {
@@ -1343,33 +1638,75 @@ static void nameserver_add_routes(int index, char **nameservers,
 	}
 }
 
+/**
+ *  @brief
+ *    Delete IPv4 or IPv6 host routes for the specified domain name
+ *    service (DNS) servers.
+ *
+ *  This attempts to delete IPv4 or IPv6 host routes for the specified
+ *  domain name service (DNS) servers with the specified attributes.
+ *
+ *  @param[in]  index        The network interface index associated
+ *                           with the output network device for
+ *                           the route.
+ *  @param[in]  nameservers  A pointer to a null-terminated array of
+ *                           mutable null-terminated C strings
+ *                           containing the IPv4 or IPv6 addresses, in
+ *                           text form, of the route DNS server
+ *                           destination addresses.
+ *  @param[in]  gw           A pointer to an immutable null-terminated
+ *                           C string containing the IPv4 or IPv6
+ *                           address, in text form, of the route next
+ *                           hop gateway address.
+ *
+ *  @sa del_nameserver_route
+ *  @sa nameserver_add_routes
+ *
+ */
 static void nameserver_del_routes(int index, char **nameservers,
+				const char *gw,
 				enum connman_ipconfig_type type)
 {
-	int i, family;
+	int i, ns_family, gw_family;
+
+	gw_family = connman_inet_check_ipaddress(gw);
+	if (gw_family < 0)
+		return;
 
 	for (i = 0; nameservers[i]; i++) {
-		family = connman_inet_check_ipaddress(nameservers[i]);
-		if (family < 0)
+		ns_family = connman_inet_check_ipaddress(nameservers[i]);
+		if (ns_family < 0 || ns_family != gw_family)
 			continue;
 
-		switch (family) {
-		case AF_INET:
-			if (type != CONNMAN_IPCONFIG_TYPE_IPV6)
-				connman_inet_del_host_route(index,
-							nameservers[i]);
-			break;
-		case AF_INET6:
-			if (type != CONNMAN_IPCONFIG_TYPE_IPV4)
-				connman_inet_del_ipv6_host_route(index,
-							nameservers[i]);
-			break;
-		}
+		del_nameserver_route(ns_family, index, nameservers[i],
+			gw, type);
 	}
 }
 
-void __connman_service_nameserver_add_routes(struct connman_service *service,
-						const char *gw)
+/**
+ *  @brief
+ *    Add IPv4 or IPv6 host routes for the domain name service (DNS)
+ *    servers associated with the specified service.
+ *
+ *  This attempts to add IPv4 or IPv6 host routes for both the
+ *  automatic and configured domain name service (DNS) servers
+ *  associated with the specified network service.
+ *
+ *  @param[in]  service      A pointer to the immutable network
+ *                           service for which to add DNS server host
+ *                           routes.
+ *  @param[in]  gw           A pointer to an immutable null-terminated
+ *                           C string containing the IPv4 or IPv6
+ *                           address, in text form, of the route next
+ *                           hop gateway address.
+ *
+ *  @sa __connman_service_nameserver_del_routes
+ *  @sa nameserver_add_routes
+ *
+ */
+void __connman_service_nameserver_add_routes(
+					const struct connman_service *service,
+					const char *gw)
 {
 	int index;
 
@@ -1396,7 +1733,32 @@ void __connman_service_nameserver_add_routes(struct connman_service *service,
 	}
 }
 
-void __connman_service_nameserver_del_routes(struct connman_service *service,
+/**
+ *  @brief
+ *    Delete IPv4 or IPv6 host routes for the domain name service (DNS)
+ *    servers associated with the specified service.
+ *
+ *  This attempts to delete IPv4 or IPv6 host routes for both the
+ *  automatic and configured domain name service (DNS) servers
+ *  associated with the specified network service.
+ *
+ *  @param[in]  service      A pointer to the immutable network
+ *                           service for which to delete DNS server
+ *                           host routes.
+ *  @param[in]  gw           A pointer to an immutable null-terminated
+ *                           C string containing the IPv4 or IPv6
+ *                           address, in text form, of the route next
+ *                           hop gateway address.
+ *  @param[in]  type         The IP configuration type for which to
+ *                           delete DNS server host routes.
+ *
+ *  @sa __connman_service_nameserver_del_routes
+ *  @sa nameserver_add_routes
+ *
+ */
+void __connman_service_nameserver_del_routes(
+					const struct connman_service *service,
+					const char *gw,
 					enum connman_ipconfig_type type)
 {
 	int index;
@@ -1408,13 +1770,41 @@ void __connman_service_nameserver_del_routes(struct connman_service *service,
 
 	if (service->nameservers_config)
 		nameserver_del_routes(index, service->nameservers_config,
-					type);
+					gw, type);
 	else if (service->nameservers)
-		nameserver_del_routes(index, service->nameservers, type);
+		nameserver_del_routes(index, service->nameservers, gw, type);
 }
 
+/**
+ *  @brief
+ *    Check the proxy setup of the specified network service.
+ *
+ *  This checks the proxy configuration of the specified network
+ *  service. The network service, @a service, may be set to
+ *  #CONNMAN_SERVICE_PROXY_METHOD_DIRECT if the current internal
+ *  method is empty or if there is no Proxy Auto-configuration (PAC)
+ *  URL received from DHCP or if the user proxy configuration is empty
+ *  or automatic and the Web Proxy Auto-discovery (WPAD) protocol
+ *  fails.
+ *
+ *  @param[in,out]  service  A pointer to the mutable network service
+ *                           for which the proxy setup is to be
+ *                           checked and for which the method may be
+ *                           updated to
+ *                           #CONNMAN_SERVICE_PROXY_METHOD_DIRECT.
+ *
+ *  @returns
+ *    True if the proxy method has been established for the specified
+ *    service; otherwise, false.
+ *
+ *  @sa connman_service_set_proxy_method
+ *  @sa __connman_wpad_start
+ *
+ */
 static bool check_proxy_setup(struct connman_service *service)
 {
+	DBG("service %p (%s)", service, connman_service_get_identifier(service));
+
 	/*
 	 * We start WPAD if we haven't got a PAC URL from DHCP and
 	 * if our proxy manual configuration is either empty or set
@@ -1430,54 +1820,2296 @@ static bool check_proxy_setup(struct connman_service *service)
 		return true;
 
 	if (__connman_wpad_start(service) < 0) {
-		service->proxy = CONNMAN_SERVICE_PROXY_METHOD_DIRECT;
-		__connman_notifier_proxy_changed(service);
+		connman_service_set_proxy_method(service,
+			CONNMAN_SERVICE_PROXY_METHOD_DIRECT);
 		return true;
 	}
 
 	return false;
 }
 
-static void cancel_online_check(struct connman_service *service)
+const char *__connman_service_online_check_mode2string(
+				enum service_online_check_mode mode)
 {
-	if (service->online_timeout_ipv4) {
-		g_source_remove(service->online_timeout_ipv4);
-		service->online_timeout_ipv4 = 0;
-		connman_service_unref(service);
+	switch (mode) {
+	case CONNMAN_SERVICE_ONLINE_CHECK_MODE_UNKNOWN:
+		break;
+	case CONNMAN_SERVICE_ONLINE_CHECK_MODE_NONE:
+		return "none";
+	case CONNMAN_SERVICE_ONLINE_CHECK_MODE_ONE_SHOT:
+		return "one-shot";
+	case CONNMAN_SERVICE_ONLINE_CHECK_MODE_CONTINUOUS:
+		return "continuous";
+	default:
+		break;
 	}
-	if (service->online_timeout_ipv6) {
-		g_source_remove(service->online_timeout_ipv6);
-		service->online_timeout_ipv6 = 0;
-		connman_service_unref(service);
-	}
+
+	return NULL;
 }
 
-static void start_online_check(struct connman_service *service,
+enum service_online_check_mode __connman_service_online_check_string2mode(
+				const char *mode)
+{
+	if (!mode)
+		return CONNMAN_SERVICE_ONLINE_CHECK_MODE_UNKNOWN;
+
+	if (g_strcmp0(mode, "none") == 0)
+		return CONNMAN_SERVICE_ONLINE_CHECK_MODE_NONE;
+	else if (g_strcmp0(mode, "one-shot") == 0)
+		return CONNMAN_SERVICE_ONLINE_CHECK_MODE_ONE_SHOT;
+	else if (g_strcmp0(mode, "continuous") == 0)
+		return CONNMAN_SERVICE_ONLINE_CHECK_MODE_CONTINUOUS;
+
+	return CONNMAN_SERVICE_ONLINE_CHECK_MODE_UNKNOWN;
+}
+
+/**
+ *  @brief
+ *    Return the "online" HTTP-based Internet reachability check mode.
+ *
+ *  @returns
+ *    The "online" HTTP-based Internet reachability check mode.
+ *
+ */
+enum service_online_check_mode __connman_service_get_online_check_mode(void)
+{
+	return connman_setting_get_uint("OnlineCheckMode");
+}
+
+/**
+ *  @brief
+ *    Return whether the "online" HTTP-based Internet reachability
+ *    checks are enabled.
+ *
+ *  @returns
+ *    True if "online" HTTP-based Internet reachability checks are
+ *    enabled; otherwise, false.
+ *
+ *  @sa __connman_service_get_online_check_mode
+ *
+ */
+bool __connman_service_is_online_check_enabled(void)
+{
+	const enum service_online_check_mode mode =
+		__connman_service_get_online_check_mode();
+
+	return mode != CONNMAN_SERVICE_ONLINE_CHECK_MODE_UNKNOWN &&
+		mode != CONNMAN_SERVICE_ONLINE_CHECK_MODE_NONE;
+}
+
+/**
+ *  @brief
+ *    Determines whether the "online" HTTP-based Internet reachability
+ *    check mode is the specified mode.
+ *
+ *  @param[in]  mode  The "online" HTTP-based Internet reachability
+ *                    check mode to confirm.
+ *
+ *  @returns
+ *    True if the current "online" HTTP-based Internet reachability
+ *    check mode is @a mode; otherwise, false.
+ *
+ *  @sa __connman_service_get_online_check_mode
+ *
+ */
+bool __connman_service_is_online_check_mode(
+		enum service_online_check_mode mode)
+{
+	return __connman_service_get_online_check_mode() == mode;
+}
+
+/**
+ *  @brief
+ *    Determine whether an "online" HTTP-based Internet reachability
+ *    check is active.
+ *
+ *  This determines whether an "online" HTTP-based Internet
+ *  reachability check is active for the specified network service IP
+ *  configuration type.
+ *
+ *  @param[in]  service  A pointer to the immutable network service
+ *                       for which to determine whether an "online"
+ *                       HTTP-based Internet reachability is active.
+ *  @param[in]  type     The IP configuration type for which to
+ *                       determine whether an "online" HTTP-based
+ *                       Internet reachability is active.
+ *
+ *  @returns
+ *    True if an "online" HTTP-based Internet reachability check is
+ *    active for the specified network service IP configuration type;
+ *    otherwise, false.
+ *
+ */
+static bool online_check_is_active(const struct connman_service *service,
+		enum connman_ipconfig_type type)
+{
+	bool do_ipv4 = false, do_ipv6 = false;
+	bool active = false;
+
+	DBG("service %p (%s) type %d (%s)",
+		service, connman_service_get_identifier(service),
+		type, __connman_ipconfig_type2string(type));
+
+	if (!service)
+		goto done;
+
+	if (type == CONNMAN_IPCONFIG_TYPE_IPV4)
+		do_ipv4 = true;
+	else if (type == CONNMAN_IPCONFIG_TYPE_IPV6)
+		do_ipv6 = true;
+	else if (type == CONNMAN_IPCONFIG_TYPE_ALL)
+		do_ipv4 = do_ipv6 = true;
+	else
+		goto done;
+
+	active = (do_ipv4 && service->online_check_state_ipv4.active) ||
+			 (do_ipv6 && service->online_check_state_ipv6.active);
+
+	DBG("active? %u", active);
+
+ done:
+	return active;
+}
+
+/**
+ *  @brief
+ *    Assign the "online" HTTP-based Internet reachability check
+ *    active state.
+ *
+ *  This assigns the "online" HTTP-based Internet reachability check
+ *  active state for the specified network service IP configuration
+ *  type.
+ *
+ *  @param[in,out]  service  A pointer to the mutable network service
+ *                           for which to assign the "online" HTTP-
+ *                           based Internet reachability active
+ *                           state.
+ *  @param[in]      type     The IP configuration type for which to
+ *                           assign the "online" HTTP-based Internet
+ *                           reachability active state.
+ *  @param[in]      active   The "online" HTTP-based Internet
+ *                           reachability active state to assign.
+ *
+ *  @sa online_check_is_active
+ *
+ */
+static void online_check_active_set_value(struct connman_service *service,
+		enum connman_ipconfig_type type,
+		bool active)
+{
+	bool do_ipv4 = false, do_ipv6 = false;
+
+	DBG("service %p (%s) type %d (%s) active? %u",
+		service, connman_service_get_identifier(service),
+		type, __connman_ipconfig_type2string(type),
+		active);
+
+	if (!service)
+		return;
+
+	if (type == CONNMAN_IPCONFIG_TYPE_IPV4)
+		do_ipv4 = true;
+	else if (type == CONNMAN_IPCONFIG_TYPE_IPV6)
+		do_ipv6 = true;
+	else if (type == CONNMAN_IPCONFIG_TYPE_ALL)
+		do_ipv4 = do_ipv6 = true;
+	else
+		return;
+
+	if (do_ipv4)
+		service->online_check_state_ipv4.active = active;
+
+	if (do_ipv6)
+		service->online_check_state_ipv6.active = active;
+}
+
+/**
+ *  @brief
+ *    Set, or assert, the "online" HTTP-based Internet reachability
+ *    check active state.
+ *
+ *  This sets, or asserts, the "online" HTTP-based Internet
+ *  reachability check active state for the specified network service
+ *  IP configuration type.
+ *
+ *  @param[in,out]  service  A pointer to the mutable network service
+ *                           for which to set the "online" HTTP-
+ *                           based Internet reachability active
+ *                           state.
+ *  @param[in]      type     The IP configuration type for which to
+ *                           set the "online" HTTP-based Internet
+ *                           reachability active state.
+ *
+ *  @sa online_check_active_set_value
+ *  @sa online_check_is_active
+ *
+ */
+static void online_check_active_set(struct connman_service *service,
+		enum connman_ipconfig_type type)
+{
+	online_check_active_set_value(service, type, true);
+}
+
+/**
+ *  @brief
+ *    Clear, or deassert, the "online" HTTP-based Internet
+ *    reachability check active state.
+ *
+ *  This clears, or deasserts, the "online" HTTP-based Internet
+ *  reachability check active state for the specified network service
+ *  IP configuration type.
+ *
+ *  @param[in,out]  service  A pointer to the mutable network service
+ *                           for which to clear the "online" HTTP-
+ *                           based Internet reachability active
+ *                           state.
+ *  @param[in]      type     The IP configuration type for which to
+ *                           clear the "online" HTTP-based Internet
+ *                           reachability active state.
+ *
+ *  @sa online_check_active_set_value
+ *  @sa online_check_is_active
+ *
+ */
+static void online_check_active_clear(struct connman_service *service,
+		enum connman_ipconfig_type type)
+{
+	online_check_active_set_value(service, type, false);
+}
+
+/**
+ *  @brief
+ *    Compute a Fibonacci online check timeout based on the specified
+ *    interval.
+ *
+ *  This computes the Fibonacci online check timeout, in seconds,
+ *  based on the specified interval in a Fibonacci series. For
+ *  example, an interval of 9 yields a timeout of 34 seconds.
+ *
+ *  @note
+ *    As compared to a geometric series, the Fibonacci series is
+ *    slightly less aggressive in backing off up to the equivalence
+ *    point at interval 12, but far more aggressive past that point,
+ *    climbing to past an hour at interval 19 whereas the geometric
+ *    series does not reach that point until interval 60.
+ *
+ *  @param[in]  interval  The interval in the geometric series for
+ *                        which to compute the online check timeout.
+ *
+ *  @returns
+ *    The timeout, in seconds, for the online check.
+ *
+ *  @sa online_check_timeout_compute_fibonacci
+ *
+ */
+static guint online_check_timeout_compute_fibonacci(unsigned int interval)
+{
+	unsigned int i;
+	guint first = 0;
+	guint second = 1;
+	guint timeout_seconds;
+
+	for (i = 0; i <= interval; i++) {
+		timeout_seconds = first;
+
+		first = second;
+
+		second = second + timeout_seconds;
+	}
+
+	return timeout_seconds;
+}
+
+/**
+ *  @brief
+ *    Compute a geometric online check timeout based on the specified
+ *    interval.
+ *
+ *  This computes the geometric online check timeout, in seconds,
+ *  based on the specified interval in a geometric series, where the
+ *  resulting value is interval^2. For example, an interval of 9
+ *  yields a timeout of 81 seconds.
+ *
+ *  @note
+ *    As compared to a Fibonacci series, the geometric series is
+ *    slightly more aggressive in backing off up to the equivalence
+ *    point at interval 12, but far less aggressive past that point,
+ *    only reaching an hour at interval 90 compared to interval 19 for
+ *    Fibonacci for a similar timeout.
+ *
+ *  @param[in]  interval  The interval in the geometric series for
+ *                        which to compute the online check timeout.
+ *
+ *  @returns
+ *    The timeout, in seconds, for the online check.
+ *
+ *  @sa online_check_timeout_compute_fibonacci
+ *
+ */
+static guint online_check_timeout_compute_geometric(unsigned int interval)
+{
+	const guint timeout_seconds = interval * interval;
+
+	return timeout_seconds;
+}
+
+/**
+ *  @brief
+ *    Cancel any "online" HTTP-based Internet reachability checks for
+ *    the specified network service IP configuration type.
+ *
+ *  This cancels any current or pending IPv4 and/or IPv6 "online"
+ *  HTTP-based Internet reachability checks for the specified network
+ *  service IP configuration type.
+ *
+ *  @note
+ *    Any lingering WISPr portal reachability context will be lazily
+ *    released at the start of the next online check for the service
+ *    and replaced with new context.
+ *
+ *  @param[in,out]  service  A pointer to the mutable network service
+ *                           for which any current or pending IPv4 or
+ *                           IPv6 "online" reachability checks should
+ *                           be canceled.
+ *  @param[in]      type     The IP configuration type for which the
+ *                           "online" reachability check is to be
+ *                           canceled.
+ *
+ *  @sa start_online_check
+ *  @sa complete_online_check
+ *  @sa __connman_wispr_start
+ *  @sa __connman_wispr_stop
+ *
+ */
+static void cancel_online_check(struct connman_service *service,
 				enum connman_ipconfig_type type)
 {
-	if (!connman_setting_get_bool("EnableOnlineCheck")) {
-		connman_info("Online check disabled. "
-			"Default service remains in READY state.");
-		return;
-	}
-	enable_online_to_ready_transition =
-		connman_setting_get_bool("EnableOnlineToReadyTransition");
-	online_check_initial_interval =
-		connman_setting_get_uint("OnlineCheckInitialInterval");
-	online_check_max_interval =
-		connman_setting_get_uint("OnlineCheckMaxInterval");
+	bool do_ipv4 = false, do_ipv6 = false;
 
-	if (type == CONNMAN_IPCONFIG_TYPE_IPV6 || check_proxy_setup(service)) {
-		cancel_online_check(service);
-		__connman_service_wispr_start(service, type);
+	DBG("service %p (%s) type %d (%s) "
+		"online_timeout_ipv4 %d online_timeout_ipv6 %d",
+		service, connman_service_get_identifier(service),
+		type, __connman_ipconfig_type2string(type),
+		service->online_check_state_ipv4.timeout,
+		service->online_check_state_ipv6.timeout);
+
+	if (type == CONNMAN_IPCONFIG_TYPE_IPV4)
+		do_ipv4 = true;
+	else if (type == CONNMAN_IPCONFIG_TYPE_IPV6)
+		do_ipv6 = true;
+	else if (type == CONNMAN_IPCONFIG_TYPE_ALL)
+		do_ipv4 = do_ipv6 = true;
+	else
+		return;
+
+	/*
+	 * First, ensure that the reachability check(s) is/are cancelled
+	 * in the WISPr module. This may fail, however, we ignore any such
+	 * failures as we still want to cancel any outstanding check(s)
+	 * from this module as well.
+	 */
+
+	if (do_ipv4)
+		__connman_wispr_cancel(service, CONNMAN_IPCONFIG_TYPE_IPV4);
+
+	if (do_ipv6)
+		__connman_wispr_cancel(service, CONNMAN_IPCONFIG_TYPE_IPV6);
+
+	/*
+	 * Now that the reachability check(s) has/have been cancelled in
+	 * the WISPr module, cancel any outstanding check(s) that may be
+	 * scheduled in this module.
+	 */
+	if (do_ipv4 &&
+		service->online_check_state_ipv4.timeout) {
+		g_source_remove(service->online_check_state_ipv4.timeout);
+		service->online_check_state_ipv4.timeout = 0;
+
+		/*
+		 * This balances the retained referece made when
+		 * g_timeout_add_seconds was called to schedule this
+		 * now-cancelled scheduled online check.
+		 */
+		connman_service_unref(service);
 	}
+
+	if (do_ipv6 &&
+		service->online_check_state_ipv6.timeout) {
+		g_source_remove(service->online_check_state_ipv6.timeout);
+		service->online_check_state_ipv6.timeout = 0;
+
+		/*
+		 * This balances the retained referece made when
+		 * g_timeout_add_seconds was called to schedule this
+		 * now-cancelled scheduled online check.
+		 */
+		connman_service_unref(service);
+	}
+
+    /* Mark the online check state as inactive. */
+
+	online_check_active_clear(service, type);
 }
 
+/**
+ *  @brief
+ *    Check whether an online check is enabled for the specified
+ *    service.
+ *
+ *  This determines whether "online" HTTP-based Internet reachability
+ *  checks are enabled for the specified network service. If not, an
+ *  information-level message is logged.
+ *
+ *  @param[in]  service  A pointer to the immutable service for which
+ *                       to determine whether "online" HTTP-based
+ *                       Internet reachability checks are enabled.
+ *
+ *  @returns
+ *    True if "online" HTTP-based Internet reachability * checks are
+ *    enabled for the specified network service; otherwise, false.
+ *
+ *  @sa start_online_check
+ *  @sa start_online_check_if_connected
+ *
+ */
+static bool online_check_is_enabled_check(
+		const struct connman_service *service)
+{
+	g_autofree char *interface = NULL;
+
+	if (!__connman_service_is_online_check_enabled()) {
+		interface = connman_service_get_interface(service);
+
+		connman_info("Online check disabled; "
+			"interface %s [ %s ] remains in %s state.",
+			interface,
+			__connman_service_type2string(service->type),
+			state2string(CONNMAN_SERVICE_STATE_READY));
+
+		return false;
+	}
+
+	return true;
+}
+
+/**
+ *  @brief
+ *    Start an "online" HTTP-based Internet reachability check for the
+ *    specified network service IP configuration type.
+ *
+ *  This attempts to start an "online" HTTP-based Internet
+ *  reachability check for the specified network service IP
+ *  configuration type.
+ *
+ *  @note
+ *    Any check is skipped, with an informational log message, if @a
+ *    OnlineCheckMode is "none".
+ *
+ *  @param[in,out]  service  A pointer to the mutable network service
+ *                           for which to start the "online"
+ *                           reachability check.
+ *  @param[in]      type     The IP configuration type for which the
+ *                           "online" reachability check is to be
+ *                           started.
+ *
+ *  @retval  0          If successful.
+ *  @retval  -EINVAL    If @a service is null or @a type is invalid.
+ *  @retval  -EPERM     If online checks are disabled via
+ *                      configuration.
+ *  @retval  -EALREADY  If online checks are already active for @a
+ *                      service.
+ *
+ *  @sa cancel_online_check
+ *  @sa complete_online_check
+ *  @sa start_online_check_if_connected
+ *  @sa __connman_service_wispr_start
+ *
+ */
+static int start_online_check(struct connman_service *service,
+				enum connman_ipconfig_type type)
+{
+	int status = 0;
+
+	DBG("service %p (%s) type %d (%s) maybe start WISPr",
+		service,
+		connman_service_get_identifier(service),
+		type,
+		__connman_ipconfig_type2string(type));
+
+	if (!service) {
+		status = -EINVAL;
+		goto done;
+	}
+
+	if (!online_check_is_enabled_check(service)) {
+		status = -EPERM;
+		goto done;
+	}
+
+	if (type == CONNMAN_IPCONFIG_TYPE_IPV6 || check_proxy_setup(service)) {
+		cancel_online_check(service, type);
+
+		status = __connman_service_wispr_start(service, type);
+	}
+
+done:
+	DBG("status %d (%s)", status, strerror(-status));
+
+	return status;
+}
+
+/**
+ *  @brief
+ *    Return the online check failures threshold state.
+ *
+ *  @param[in]  service  A pointer to the immutable service for which
+ *                       to return the online check failures threshold
+ *                       state.
+ *
+ *  @returns
+ *    True if the online check failures threshold was met; otherwise,
+ *    false.
+ *
+ *  @sa online_check_failures_threshold_was_met_set_value
+ *  @sa online_check_failures_threshold_was_met_set
+ *  @sa online_check_failures_threshold_was_met_clear
+ *
+ */
+static bool online_check_failures_threshold_was_met(
+			const struct connman_service *service)
+{
+	return service->online_check_failures_met_threshold;
+}
+
+/**
+ *  @brief
+ *    Set the online check failures threshold state to the specified
+ *    value.
+ *
+ *  @param[in,out]  service  A pointer to the mutable service for which
+ *                           to set the failures threshold state.
+ *  @param[in]      value    The value to set the @a service failures
+ *                           threshold state to.
+ *
+ *  @sa online_check_failures_threshold_was_met_set
+ *  @sa online_check_failures_threshold_was_met_clear
+ *
+ */
+static void online_check_failures_threshold_was_met_set_value(
+			struct connman_service *service, bool value)
+{
+	DBG("service %p (%s) failures met threshold %u",
+		service, connman_service_get_identifier(service),
+		value);
+
+	service->online_check_failures_met_threshold = value;
+}
+
+/**
+ *  @brief
+ *    Set (that is, assert) the online check failures threshold state.
+ *
+ *  @param[in,out]  service  A pointer to the mutable service for which
+ *                           to set the failures threshold state.
+ *
+ *  @sa online_check_failures_threshold_was_met_set_value
+ *  @sa online_check_failures_threshold_was_met_clear
+ *
+ */
+static void online_check_failures_threshold_was_met_set(
+			struct connman_service *service)
+{
+	online_check_failures_threshold_was_met_set_value(service, true);
+}
+
+/**
+ *  @brief
+ *    Clear (that is, deassert) the online check failures threshold
+ *    state.
+ *
+ *  @param[in,out]  service  A pointer to the mutable service for which
+ *                           to clear the failures threshold state.
+ *
+ *  @sa online_check_failures_threshold_was_met_set_value
+ *  @sa online_check_failures_threshold_was_met_set
+ *
+ */
+static void online_check_failures_threshold_was_met_clear(
+			struct connman_service *service)
+{
+	online_check_failures_threshold_was_met_set_value(service, false);
+}
+
+/**
+ *  Reset the specified counter to zero (0).
+ *
+ *  @param[in,out]  counter  A pointer to the counter to reset by
+ *                           setting it to zero (0).
+ *
+ */
+static inline void online_check_counter_reset(
+			unsigned int *counter)
+{
+	if (!counter)
+		return;
+
+	*counter = 0;
+}
+
+/**
+ *  @brief
+ *    Reset to zero (0) the IPv4 and IPv6 online check failure
+ *    counters for the specified service.
+ *
+ *  @param[in]   service   A pointer to the mutable service for which
+ *                         to reset the IPv4 and IPv6 online check
+ *                         failure counters.
+ *
+ *  @sa online_check_successes_reset
+ *
+ */
+static void online_check_failures_reset(struct connman_service *service)
+{
+	DBG("service %p (%s)",
+		service, connman_service_get_identifier(service));
+
+	online_check_counter_reset(&service->online_check_state_ipv4.failures);
+	online_check_counter_reset(&service->online_check_state_ipv6.failures);
+}
+
+/**
+ *  @brief
+ *    Reset to zero (0) the IPv4 and IPv6 online check success
+ *    counters for the specified service.
+ *
+ *  @param[in]   service   A pointer to the mutable service for which
+ *                         to reset the IPv4 and IPv6 online check
+ *                         success counters.
+ *
+ *  @sa online_check_failures_reset
+ *
+ */
+static void online_check_successes_reset(struct connman_service *service)
+{
+	DBG("service %p (%s)",
+		service, connman_service_get_identifier(service));
+
+	online_check_counter_reset(&service->online_check_state_ipv4.successes);
+	online_check_counter_reset(&service->online_check_state_ipv6.successes);
+}
+
+/**
+ *  @brief
+ *    Reset the online check state for the specified service.
+ *
+ *  This resets the online check state for the specified service,
+ *  including its failure threshold state, failure counters, and
+ *  success counters.
+ *
+ *  @param[in]   service   A pointer to the mutable service for which
+ *                         to reset the online check state.
+ *
+ *  @sa online_check_failures_reset
+ *  @sa online_check_successes_reset
+ *  @sa online_check_failures_threshold_was_met_clear
+ *
+ */
+static void online_check_state_reset(struct connman_service *service)
+{
+	online_check_failures_reset(service);
+
+	online_check_successes_reset(service);
+
+	online_check_failures_threshold_was_met_clear(service);
+
+	clear_error(service);
+}
+
+/**
+ *  @brief
+ *    Log the specified IPv4 and IPv6 online check counters for the
+ *    specified service.
+ *
+ *  This logs the specified IPv4 and IPv6 online check counters
+ *  described by the provided description for the specified network
+ *  service.
+ *
+ *  @param[in]  service              A pointer to the immutable network
+ *                                   service associated with @a
+ *                                   ipv4_counter and @a ipv6_counter.
+ *  @param[in]  counter_description  A pointer to a null-terminated C
+ *                                   string describing @a ipv4_counter
+ *                                   and @a ipv6_counter. For example,
+ *                                   "failure".
+ *  @param[in]  ipv4_counter         The IPv4-specific counter to log.
+ *  @param[in]  ipv6_counter         The IPv6-specific counter to log.
+ *
+ */
+static void online_check_counters_log(
+			const struct connman_service *service,
+			const char *counter_description,
+			unsigned int ipv4_counter,
+			unsigned int ipv6_counter)
+{
+	DBG("service %p (%s) "
+		"ipv4 state %d (%s) %s(s/es) %u "
+		"ipv6 state %d (%s) %s(s/es) %u ",
+		service, connman_service_get_identifier(service),
+		service->state_ipv4, state2string(service->state_ipv4),
+		counter_description,
+		ipv4_counter,
+		service->state_ipv6, state2string(service->state_ipv6),
+		counter_description,
+		ipv6_counter);
+}
+
+/**
+ *  @brief
+ *    Determine whether an online check counter has met its threshold.
+ *
+ *  This determines whether an online check counter associated with
+ *  the specified network service has met its threshold, where the
+ *  threshold is accessed from the configuration store with the
+ *  specified key.
+ *
+ *  @param[in]  service                A pointer to the immutable
+ *                                     network service associated with
+ *                                     the counter to check.
+ *  @param[in]  counter_threshold_key  A pointer to a null-terminated
+ *                                     C string containing the key to
+ *                                     use with the configuration
+ *                                     store to access the threshold
+ *                                     value to check the counter
+ *                                     against.
+ *  @param[in]  counter_description    A pointer to a null-terminated
+ *                                     C string describing the counter
+ *                                     to check. For example, "failure".
+ *  @param[in]  predicate              A pointer to the predicate
+ *                                     function to invoke to make the
+ *                                     actual determination of whether
+ *                                     the counter has met the
+ *                                     threshold accessed by @a
+ *                                     counter_threshold_key.
+ *
+ *  @returns
+ *    True if the counter has met the threshold; otherwise, false.
+ *
+ */
+static bool online_check_counter_threshold_is_met(
+			const struct connman_service *service,
+			const char *counter_threshold_key,
+			const char *counter_description,
+			is_counter_threshold_met_predicate_t predicate)
+{
+	unsigned int counter_threshold;
+	bool threshold_met = false;
+
+	if (!service ||
+		!counter_threshold_key ||
+		!counter_description ||
+		!predicate)
+		goto done;
+
+	counter_threshold = connman_setting_get_uint(counter_threshold_key);
+
+	threshold_met = predicate(service,
+						counter_description,
+						counter_threshold);
+
+	DBG("service %p (%s) %s threshold %u %s(s) met %u",
+		service, connman_service_get_identifier(service),
+		counter_description,
+		counter_threshold,
+		counter_description,
+		threshold_met);
+
+done:
+	return threshold_met;
+}
+
+/**
+ *  @brief
+ *    Determine whether the service has met the online check failure
+ *    threshold.
+ *
+ *  This predicate determines whether the online check failure
+ *  threshold has been met by the specified network service.
+ *
+ *  @param[in]  service                A pointer to the immutable
+ *                                     network service for which to
+ *                                     check whether its has met the
+ *                                     online check failure threshold.
+ *  @param[in]  counter_description    A pointer to a null-terminated
+ *                                     C string describing the failure
+ *                                     counter. For example,
+ *                                     "failure".
+ *  @param[in]  counter_threshold      The threshold value to check the
+ *                                     failure counter against.
+ *
+ *  @returns
+ *    True if the online check failure counter has met the failure
+ *    threshold; otherwise, false.
+ *
+ *  @sa online_check_failures_threshold_is_met
+ *
+ */
+static bool is_online_check_failure_threshold_met_predicate(
+			const struct connman_service *service,
+			const char *counter_description,
+			unsigned int counter_threshold)
+{
+	bool ipv4_is_connected;
+	bool ipv6_is_connected;
+	bool threshold_met = false;
+
+	online_check_counters_log(service,
+		counter_description,
+		service->online_check_state_ipv4.failures,
+		service->online_check_state_ipv6.failures);
+
+	ipv4_is_connected = is_connected(service->state_ipv4);
+	ipv6_is_connected = is_connected(service->state_ipv6);
+
+	/*
+	 * It is entirely possible that IPv4 reachability is fine and that
+	 * IPv6 reachablity is not due to the premises ISP, premises
+	 * Internet access equipment (that is, CPE), availability of the
+	 * reachability endpoint infrastructure, etc.
+	 *
+	 * Consequently, we want to see bilateral failures of BOTH IPv4
+	 * AND IPv6 in excess of the threshold, to the extent either is
+	 * connected (based on the #is_connected predicate).
+	 */
+	if ((!ipv6_is_connected &&
+		 ipv4_is_connected &&
+		 service->online_check_state_ipv4.failures >=
+		 counter_threshold) ||
+
+		(!ipv4_is_connected &&
+		ipv6_is_connected &&
+		service->online_check_state_ipv6.failures >=
+		counter_threshold) ||
+
+		(ipv4_is_connected &&
+		service->online_check_state_ipv4.failures >=
+		counter_threshold &&
+		ipv6_is_connected &&
+		service->online_check_state_ipv6.failures >=
+		counter_threshold)) {
+		threshold_met = true;
+	}
+
+	return threshold_met;
+}
+
+/**
+ *  @brief
+ *    Determine whether the online check failures threshold is met.
+ *
+ *  This attempts to determine whether the online check failures
+ *  threshold is met, comparing the current IPv4 and IPv6 online check
+ *  failure counts against the "OnlineCheckFailuresThreshold" settings
+ *  value and returning @a true if @b both the IPv4 and IPv6 counts
+ *  meet or exceed the threshold.
+ *
+ *  @param[in]  service  A pointer to the immutable service for which
+ *                       to determine whether the online check failure
+ *                       threshold is met.
+ *
+ *  @returns
+ *    True if the failure threshold is met; otherwise, false.
+ *
+ *  @sa online_check_successes_threshold_is_met
+ *
+ */
+static bool online_check_failures_threshold_is_met(
+			const struct connman_service *service)
+{
+	const char * const counter_threshold_key =
+		"OnlineCheckFailuresThreshold";
+	const char * const counter_description =
+		"failure";
+
+	return online_check_counter_threshold_is_met(service,
+			counter_threshold_key,
+			counter_description,
+			is_online_check_failure_threshold_met_predicate);
+}
+
+/**
+ *  @brief
+ *    Determine whether the service has met the online check success
+ *    threshold.
+ *
+ *  This predicate determines whether the online check success
+ *  threshold has been met by the specified network service.
+ *
+ *  @param[in]  service                A pointer to the immutable
+ *                                     network service for which to
+ *                                     check whether its has met the
+ *                                     online check success threshold.
+ *  @param[in]  counter_description    A pointer to a null-terminated
+ *                                     C string describing the success
+ *                                     counter. For example,
+ *                                     "success".
+ *  @param[in]  counter_threshold      The threshold value to check the
+ *                                     success counter against.
+ *
+ *  @returns
+ *    True if the online check success counter has met the success
+ *    threshold; otherwise, false.
+ *
+ *  @sa online_check_successes_threshold_is_met
+ *
+ */
+static bool is_online_check_success_threshold_met_predicate(
+			const struct connman_service *service,
+			const char *counter_description,
+			unsigned int counter_threshold)
+{
+	bool threshold_met = false;
+
+	online_check_counters_log(service,
+		counter_description,
+		service->online_check_state_ipv4.successes,
+		service->online_check_state_ipv6.successes);
+
+	/*
+	 * It is entirely possible that IPv4 reachability is fine and that
+	 * IPv6 reachablity is not due to the premises ISP, premises
+	 * Internet access equipment (that is, CPE), availability of the
+	 * reachability endpoint infrastructure, etc.
+	 *
+	 * Consequently, we want to see bilateral successes of EITHER IPv4
+	 * OR IPv6 (as with #combine_state) in excess of the threshold, to
+	 * the extent either is connected (based on the #is_connected
+	 * predicate).
+	 */
+
+	if ((is_connected(service->state_ipv4) &&
+		service->online_check_state_ipv4.successes >=
+		counter_threshold) ||
+		(is_connected(service->state_ipv6) &&
+		service->online_check_state_ipv6.successes >=
+		counter_threshold)) {
+		threshold_met = true;
+	}
+
+	return threshold_met;
+}
+
+/**
+ *  @brief
+ *    Determine whether the online check successes threshold is met.
+ *
+ *  This attempts to determine whether the online check successes
+ *  threshold is met, comparing the current IPv4 and IPv6 online check
+ *  success counts against the "OnlineCheckSuccessesThreshold" settings
+ *  value and returning @a true if @b either the IPv4 @b or IPv6 counts
+ *  meet or exceed the threshold.
+ *
+ *  @param[in]  service  A pointer to the immutable service for which
+ *                       to determine whether the online check success
+ *                       threshold is met.
+ *
+ *  @returns
+ *    True if the success threshold is met; otherwise, false.
+ *
+ *  @sa online_check_failures_threshold_is_met
+ *
+ */
+static bool online_check_successes_threshold_is_met(
+			const struct connman_service *service)
+{
+	const char * const counter_threshold_key =
+		"OnlineCheckSuccessesThreshold";
+	const char * const counter_description =
+		"success";
+
+	return online_check_counter_threshold_is_met(service,
+			counter_threshold_key,
+			counter_description,
+			is_online_check_success_threshold_met_predicate);
+}
+
+/**
+ *  @brief
+ *    Retry an "online" HTTP-based Internet reachability check.
+ *
+ *  This retries an "online" HTTP-based Internet reachability check
+ *  for the specified network service IP configuration type.
+ *
+ *  @param[in,out]  service  A pointer to the mutable network service
+ *                           for which an "online" reachability check
+ *                           should be retried.
+ *  @param[in]      type     The IP configuration type for which an
+ *                           "online" reachability check should be
+ *                           retried.
+ *
+ *  @sa complete_online_check
+ *  @sa redo_wispr_ipv4
+ *  @sa redo_wispr_ipv6
+ *
+ */
+static void redo_wispr(struct connman_service *service,
+					enum connman_ipconfig_type type)
+{
+	DBG("Retrying service %p (%s) type %d (%s) WISPr",
+		service, connman_service_get_identifier(service),
+		type, __connman_ipconfig_type2string(type));
+
+	__connman_wispr_start(service, type,
+			online_check_connect_timeout_ms, complete_online_check);
+
+	// Release the reference to the service taken when
+	// g_timeout_add_seconds was invoked with the callback
+	// that, in turn, invoked this function.
+
+	connman_service_unref(service);
+}
+
+/**
+ *  @brief
+ *    Retry an "online" HTTP-based Internet reachability check
+ *    callback.
+ *
+ *  This callback retries an IPv4 "online" HTTP-based Internet
+ *  reachability check for the specified network service.
+ *
+ *  @param[in,out]  user_data  A pointer to the mutable network
+ *                             service for which an IPv4 "online"
+ *                             reachability check should be retried.
+ *
+ *  @returns
+ *    FALSE (that is, G_SOURCE_REMOVE) unconditionally, indicating
+ *    that the timeout source that triggered this callback should be
+ *    removed on callback completion.
+ *
+ *  @sa complete_online_check
+ *  @sa redo_wispr
+ *  @sa redo_wispr_ipv6
+ *
+ */
+static gboolean redo_wispr_ipv4(gpointer user_data)
+{
+	struct connman_service *service = user_data;
+
+	service->online_check_state_ipv4.timeout = 0;
+
+	redo_wispr(service, CONNMAN_IPCONFIG_TYPE_IPV4);
+
+	return FALSE;
+}
+
+/**
+ *  @brief
+ *    Retry an "online" HTTP-based Internet reachability check
+ *    callback.
+ *
+ *  This callback retries an IPv6 "online" HTTP-based Internet
+ *  reachability check for the specified network service.
+ *
+ *  @param[in,out]  user_data  A pointer to the mutable network
+ *                             service for which an IPv6 "online"
+ *                             reachability check should be retried.
+ *
+ *  @returns
+ *    FALSE (that is, G_SOURCE_REMOVE) unconditionally, indicating
+ *    that the timeout source that triggered this callback should be
+ *    removed on callback completion.
+ *
+ *  @sa complete_online_check
+ *  @sa redo_wispr
+ *  @sa redo_wispr_ipv4
+ *
+ */
+static gboolean redo_wispr_ipv6(gpointer user_data)
+{
+	struct connman_service *service = user_data;
+
+	service->online_check_state_ipv6.timeout = 0;
+
+	redo_wispr(service, CONNMAN_IPCONFIG_TYPE_IPV6);
+
+	return FALSE;
+}
+
+/**
+ *  @brief
+ *    Reschedule an "online" HTTP-based Internet reachability check
+ *    for the specified network service IP configuration type.
+ *
+ *  This attempts to eschedule an "online" HTTP-based Internet
+ *  reachability check for the specified network service IP
+ *  configuration type with the provided interval and timeout
+ *  identifier.
+ *
+ *  @param[in,out]  service             A pointer to the mutable
+ *                                      network service for which to
+ *                                      reschedule the "online"
+ *                                      reachability check. On
+ *                                      success, the service will have
+ *                                      a reference retained that must
+ *                                      be elsewhere released.
+ *  @param[in]      type                The IP configuration type for
+ *                                      which the "online"
+ *                                      reachability check is to be
+ *                                      rescheduled.
+ *  @param[in,out]  online_check_state  A pointer to the mutable IP
+ *                                      configuration type-specific
+ *                                      "online" reachability check
+ *                                      state associated with @a
+ *                                      service and @a type. On
+ *                                      success, the 'interval' field
+ *                                      will be incremented by one (1)
+ *                                      if it is less than the value
+ *                                      of the @a
+ *                                      OnlineCheckMaxInterval
+ *                                      configuration setting and the
+ *                                      'timeout' field this will be
+ *                                      updated with the GLib main
+ *                                      loop timer identifier
+ *                                      associated with the
+ *                                      rescheduled "online"
+ *                                      HTTP-based Internet
+ *                                      reachability check request.
+ *
+ *  @sa redo_wispr_ipv4
+ *  @sa redo_wispr_ipv6
+ *
+ */
+static void reschedule_online_check(struct connman_service *service,
+			enum connman_ipconfig_type type,
+			struct online_check_state *online_check_state)
+{
+	GSourceFunc redo_func;
+	guint seconds;
+
+	if (!service || !online_check_state)
+		return;
+
+	DBG("service %p (%s) type %d (%s) interval %u timeout %u",
+		service,
+		connman_service_get_identifier(service),
+		type,
+		__connman_ipconfig_type2string(type),
+		online_check_state->interval,
+		online_check_state->timeout);
+
+	if (type == CONNMAN_IPCONFIG_TYPE_IPV4)
+		redo_func = redo_wispr_ipv4;
+	else if (type == CONNMAN_IPCONFIG_TYPE_IPV6)
+		redo_func = redo_wispr_ipv6;
+	else
+		return;
+
+	DBG("updating online checkout timeout period");
+
+	seconds = online_check_timeout_compute_func(
+				online_check_state->interval);
+
+	DBG("service %p (%s) type %d (%s) interval %u style \"%s\" seconds %u",
+		service,
+		connman_service_get_identifier(service),
+		type, __connman_ipconfig_type2string(type),
+		online_check_state->interval,
+		online_check_timeout_interval_style,
+		seconds);
+
+	online_check_state->timeout = g_timeout_add_seconds(seconds,
+				redo_func, connman_service_ref(service));
+
+	/* Increment the interval for the next time, limiting to a maximum
+	 * interval of @a online_check_max_interval.
+	 */
+	if (online_check_state->interval < online_check_max_interval)
+		online_check_state->interval++;
+}
+
+/**
+ *  @brief
+ *    Increment and log the specified online check counter.
+ *
+ *  This increments by one (1) and logs the post-increment value of
+ *  the specified online check counter associated with the specified
+ *  network service.
+ *
+ *  @param[in]  service              A pointer to the immutable network
+ *                                   service associated with @a
+ *                                   counter.
+ *  @param[in]  type                 The IP configuration type associated
+ *                                   with @a counter.
+ *  @param[in]  counter_description  A pointer to a null-terminated C
+ *                                   string describing @a counter. For
+ *                                   example, "failure".
+ *
+ */
+static void online_check_counter_increment_and_log(
+			const struct connman_service *service,
+			enum connman_ipconfig_type type,
+			const char *counter_description,
+			unsigned int *counter)
+{
+	if (!service || !counter_description || !counter)
+		return;
+
+	(*counter)++;
+
+	DBG("service %p (%s) type %d (%s) %s %u",
+		service, connman_service_get_identifier(service),
+		type, __connman_ipconfig_type2string(type),
+		counter_description, *counter);
+}
+
+/**
+ *  @brief
+ *    Log an online check success.
+ *
+ *  This logs an online check success for the specified network
+ *  service IP configuration type.
+ *
+ *  @param[in]  service  A pointer to the immutable network
+ *                       service for which to log an online
+ *                       check success.
+ *  @param[in]  type     The IP configuration type for which
+ *                       the online check was successful.
+ *
+ */
+static void online_check_log_success(const struct connman_service *service,
+			enum connman_ipconfig_type type)
+{
+	g_autofree char *interface = NULL;
+
+	interface = connman_service_get_interface(service);
+
+	connman_info("Interface %s [ %s ] %s online check to %s succeeded",
+		interface,
+		__connman_service_type2string(service->type),
+		__connman_ipconfig_type2string(type),
+		type == CONNMAN_IPCONFIG_TYPE_IPV4 ?
+			connman_setting_get_string("OnlineCheckIPv4URL") :
+			connman_setting_get_string("OnlineCheckIPv6URL"));
+}
+
+/**
+ *  @brief
+ *    Log that an online check counter has met its threshold.
+ *
+ *  This logs that an online check counter associated with the
+ *  specified network service has met its threshold.
+ *
+ *  @param[in]  service                A pointer to the immutable
+ *                                     network service for which to
+ *                                     log that one of its online
+ *                                     check counters has met its
+ *                                     threshold.
+ *  @param[in]  counter_threshold_key  A pointer to a null-terminated
+ *                                     C string containing the key to
+ *                                     use with the configuration
+ *                                     store to access the threshold
+ *                                     value for the counter.
+ *  @param[in]  counter_description    A pointer to a null-terminated
+ *                                     C string describing the counter
+ *                                     to check. For example,
+ *                                     "failure(s)".
+ *
+ */
+static void continuous_online_check_log_counter_threshold_met(
+			const struct connman_service *service,
+			const char *counter_threshold_key,
+			const char *counter_description)
+{
+	g_autofree char *interface = NULL;
+
+	interface = connman_service_get_interface(service);
+
+	connman_warn("Interface %s [ %s ] online check had %u back-to-back "
+		"%s; %s threshold met",
+		interface,
+		__connman_service_type2string(service->type),
+		connman_setting_get_uint(counter_threshold_key),
+				 counter_description,
+				 counter_description);
+}
+
+/**
+ *  @brief
+ *    Log that an online check success counter has met its threshold.
+ *
+ *  This logs that an online check success counter associated with the
+ *  specified network service has met its threshold.
+ *
+ *  @param[in]  service                A pointer to the immutable
+ *                                     network service for which to
+ *                                     log that its online check
+ *                                     success counter has met its
+ *                                     threshold.
+ *
+ */
+static void continuous_online_check_log_successes_threshold_met(
+			const struct connman_service *service
+)
+{
+	static const char *const counter_threshold_key =
+		"OnlineCheckSuccessesThreshold";
+	static const char *const counter_description =
+		"success(es)";
+
+	continuous_online_check_log_counter_threshold_met(service,
+		counter_threshold_key,
+		counter_description);
+}
+
+/**
+ *  @brief
+ *    Log that an online check failure counter has met its threshold.
+ *
+ *  This logs that an online check failure counter associated with the
+ *  specified network service has met its threshold.
+ *
+ *  @param[in]  service                A pointer to the immutable
+ *                                     network service for which to
+ *                                     log that its online check
+ *                                     failure counter has met its
+ *                                     threshold.
+ *
+ */
+static void continuous_online_check_log_failures_threshold_met(
+			const struct connman_service *service
+)
+{
+	static const char *const counter_threshold_key =
+		"OnlineCheckFailuresThreshold";
+	static const char *const counter_description =
+		"failure(s)";
+
+	continuous_online_check_log_counter_threshold_met(service,
+		counter_threshold_key,
+		counter_description);
+}
+
+/**
+ *  @brief
+ *    Handle the successful completion of an "online" HTTP-based
+ *    Internet reachability check for the specified network service
+ *    and IP configuration type for the "one-shot" online check mode.
+ *
+ *  This handles the completion of a successful "online" HTTP-based
+ *  Internet reachability check for the specified network service and
+ *  IP configuration type for the "one-shot" online check mode. This
+ *  effectively "bookends" an earlier #__connman_service_wispr_start.
+ *
+ *  @param[in,out]  service             A pointer to the mutable service
+ *                                      for which to handle a
+ *                                      successful previously-requested
+ *                                      online check.
+ *  @param[in]      type                The IP configuration type for
+ *                                      which to handle a successful
+ *                                      previously-requested online
+ *                                      check.
+ *  @param[in,out]  online_check_state  A pointer to the online check
+ *                                      state for @a service
+ *                                      associated with @a type.
+ *
+ *  @returns
+ *    False, unconditionally.
+ *
+ *  @sa handle_oneshot_online_check_failure
+ *  @sa handle_online_check_success
+ *
+ */
+static bool handle_oneshot_online_check_success(
+			struct connman_service *service,
+			enum connman_ipconfig_type type,
+			struct online_check_state *online_check_state)
+{
+	const bool reschedule = true;
+
+	/*
+	 * Simply log the success, mark the service IP configuration state
+	 * as ONLINE, and return.
+	 */
+	online_check_log_success(service, type);
+
+	__connman_service_ipconfig_indicate_state(service,
+		CONNMAN_SERVICE_STATE_ONLINE,
+		type);
+
+	return !reschedule;
+}
+
+/**
+ *  @brief
+ *    Handle the successful completion of an "online" HTTP-based
+ *    Internet reachability check for the specified network service
+ *    and IP configuration type for the "continuous" online check mode.
+ *
+ *  This handles the completion of a successful "online" HTTP-based
+ *  Internet reachability check for the specified network service and
+ *  IP configuration type for the "continuous" online check mode. This
+ *  effectively "bookends" an earlier #__connman_service_wispr_start.
+ *
+ *  @param[in,out]  service             A pointer to the mutable service
+ *                                      for which to handle a
+ *                                      successful previously-requested
+ *                                      online check.
+ *  @param[in]      type                The IP configuration type for
+ *                                      which to handle a successful
+ *                                      previously-requested online
+ *                                      check.
+ *  @param[in,out]  online_check_state  A pointer to the online check
+ *                                      state for @a service
+ *                                      associated with @a type.
+ *
+ *  @returns
+ *    True if another online check should be scheduled; otherwise,
+ *    false.
+ *
+ *  @sa handle_continuous_online_check_failure
+ *  @sa handle_online_check_success
+ *
+ */
+static bool handle_continuous_online_check_success(
+			struct connman_service *service,
+			enum connman_ipconfig_type type,
+			struct online_check_state *online_check_state)
+{
+	bool failures_threshold_was_met;
+	bool successes_threshold_is_met;
+	const bool reschedule = true;
+
+	/* Unconditionally increment and log the success counter. */
+
+	online_check_counter_increment_and_log(service, type,
+		"successes", &online_check_state->successes);
+
+	/*
+	 * Ultimately, for failures, we are looking for a STRING of
+	 * SUSTAINED, BACK-TO-BACK failures to meet the failures
+	 * threshold. Consequently, any success should reset the
+	 * corresponding failure count back to zero (0).
+	 */
+	online_check_counter_reset(&online_check_state->failures);
+
+	failures_threshold_was_met =
+		online_check_failures_threshold_was_met(service);
+	successes_threshold_is_met =
+		online_check_successes_threshold_is_met(service);
+
+	DBG("failures threshold was met %u, "
+		"successes threshold is met %u, "
+		"default %u",
+		failures_threshold_was_met,
+		successes_threshold_is_met,
+		connman_service_is_default(service));
+
+	/*
+	 * If the service HAD previously-exceeded the failure threshold
+	 * AND if this is the first success, then reset the online check
+	 * interval to the initial, minimum value since we want to recover
+	 * as quickly as possible with a STRING of SUSTAINED, BACK-TO-BACK
+	 * successes, where the length of that string is dictated by the
+	 * "OnlineCheckSuccessesThreshold" settings value.
+	 *
+	 * Otherwise, if the service HAD NOT previously-exceeded the
+	 * failure threshold OR if it HAD previously-exceeded the failure
+	 * threshold AND the successes threshold was met, then reset the
+	 * online check interval to the maximum value.
+	 */
+	if (failures_threshold_was_met &&
+		online_check_state->successes == 1)
+		online_check_state->interval = online_check_initial_interval;
+	else if (!failures_threshold_was_met ||
+		(failures_threshold_was_met && successes_threshold_is_met))
+		online_check_state->interval = online_check_max_interval;
+
+	/*
+	 * If the service HAD NOT previously-exceeded the failure
+	 * threshold, then simply mark the service IP configuration state
+	 * as ONLINE.
+	 *
+	 * Otherwise, if the service HAD previously exceeded the failure
+	 * threshold AND successes meet or exceed the configured success
+	 * threshold, then re-sort the network services and update the
+	 * gateways accordingly.
+	 *
+	 * The succeeding service will be promoted until such time as it
+	 * has a configured number of failures, at which time, we will
+	 * resort again.
+	 *
+	 */
+	if (!failures_threshold_was_met) {
+		if (online_check_state->successes == 1)
+			online_check_log_success(service, type);
+
+		if (connman_service_is_default(service))
+			__connman_service_ipconfig_indicate_state(service,
+				CONNMAN_SERVICE_STATE_ONLINE,
+				type);
+	} else if (failures_threshold_was_met &&
+			   successes_threshold_is_met) {
+		online_check_log_success(service, type);
+
+		continuous_online_check_log_successes_threshold_met(service);
+
+		online_check_state_reset(service);
+
+		/*
+		 * The ordering here is considered and intentional. FIRST, now
+		 * that this service has cleared / reset the online check
+		 * state, re-sort the service list. This may promote this
+		 * service back to the default. SECOND, make the READY to
+		 * ONLINE promotion, since that promotion is qualified with
+		 * this service being the default (that is, has the default
+		 * route) service.
+		 */
+		SERVICE_LIST_SORT();
+
+		if (connman_service_is_default(service)) {
+			__connman_service_ipconfig_indicate_state(
+				service,
+				CONNMAN_SERVICE_STATE_ONLINE,
+				type);
+		}
+
+		__connman_gateway_update();
+	}
+
+	return reschedule;
+}
+
+/**
+ *  @brief
+ *    Handle the successful completion of an "online" HTTP-based
+ *    Internet reachability check for the specified network service
+ *    and IP configuration type.
+ *
+ *  This handles the completion of a successful "online" HTTP-based
+ *  Internet reachability check for the specified network service and
+ *  IP configuration type. This effectively "bookends" an earlier
+ *  #__connman_service_wispr_start.
+ *
+ *  @param[in,out]  service             A pointer to the mutable service
+ *                                      for which to handle a
+ *                                      successful previously-requested
+ *                                      online check.
+ *  @param[in]      type                The IP configuration type for
+ *                                      which to handle a successful
+ *                                      previously-requested online
+ *                                      check.
+ *  @param[in,out]  online_check_state  A pointer to the online check
+ *                                      state for @a service
+ *                                      associated with @a type.
+ *  @param[in]      oneshot             A Boolean indicating whether the
+ *                                      online check mode is
+ *                                      "one-shot" (true) or
+ *                                      "continuous" (false).
+ *
+ *  @returns
+ *    True if another online check should be scheduled; otherwise,
+ *    false.
+ *
+ *  @sa handle_online_check_failure
+ *  @sa handle_oneshot_online_check_success
+ *  @sa handle_continuous_online_check_success
+ *
+ */
+static bool handle_online_check_success(struct connman_service *service,
+				enum connman_ipconfig_type type,
+				struct online_check_state *online_check_state,
+				bool oneshot)
+{
+	bool reschedule;
+
+	DBG("service %p (%s) type %d (%s) "
+		"one-shot %u\n",
+		service,
+		connman_service_get_identifier(service),
+		type, __connman_ipconfig_type2string(type),
+		oneshot);
+
+	if (oneshot)
+		reschedule = handle_oneshot_online_check_success(service,
+						type,
+						online_check_state);
+	else
+		reschedule = handle_continuous_online_check_success(service,
+						type,
+						online_check_state);
+
+	return reschedule;
+}
+
+/**
+ *  @brief
+ *    Log an online check failure.
+ *
+ *  This logs an online check failure for the specified network
+ *  service IP configuration type.
+ *
+ *  @param[in]  service  A pointer to the immutable network
+ *                       service for which to log an online
+ *                       check failure.
+ *  @param[in]  type     The IP configuration type for which
+ *                       the online check failed.
+ *  @param[in]  message  A pointer to an immutable null-terminated
+ *                       C string describing the reason for the online
+ *                       check failure.
+ *
+ */
+static void online_check_log_failure(const struct connman_service *service,
+			enum connman_ipconfig_type type,
+			const char *message)
+{
+	g_autofree char *interface = NULL;
+
+	interface = connman_service_get_interface(service);
+
+	connman_warn("Interface %s [ %s ] %s online check to %s failed: %s",
+		interface,
+		__connman_service_type2string(service->type),
+		__connman_ipconfig_type2string(type),
+		type == CONNMAN_IPCONFIG_TYPE_IPV4 ?
+			connman_setting_get_string("OnlineCheckIPv4URL") :
+			connman_setting_get_string("OnlineCheckIPv6URL"),
+			message);
+}
+
+/**
+ *  @brief
+ *    Handle the failed completion of an one-shot mode "online"
+ *    HTTP-based Internet reachability check for the specified network
+ *    service and IP configuration type for the "one-shot" online
+ *    check mode.
+ *
+ *  This handles the completion of a failed one-shot mode "online"
+ *  HTTP-based Internet reachability check for the specified network
+ *  service and IP configuration type for the "one-shot" online check
+ *  mode. This effectively "bookends" an earlier
+ *  #__connman_service_wispr_start.
+ *
+ *  This simply indicates that rescheduling another check is desired.
+ *
+ *  @param[in,out]  service             A pointer to the mutable service
+ *                                      for which to handle a
+ *                                      failed previously-requested
+ *                                      online check.
+ *  @param[in]      type                The IP configuration type for
+ *                                      which to handle a failed
+ *                                      previously-requested online
+ *                                      check.
+ *  @param[in]      ipconfig_state      The current @a type IP
+ *                                      configuration state for @a
+ *                                      service.
+ *  @param[in,out]  online_check_state  A pointer to the online check
+ *                                      state for @a service
+ *                                      associated with @a type.
+ *  @param[in]      err                 The error status associated with
+ *                                      the failed previously-requested
+ *                                      online check. This is expected
+ *                                      to be less than zero ('< 0').
+ *  @param[in]      message             A pointer to an immutable null-
+ *                                      terminated C string describing
+ *                                      the reason for the online
+ *                                      check failure.
+ *
+ *  @returns
+ *    True, unconditionally.
+ *
+ *  @sa handle_online_check_failure
+ *  @sa handle_oneshot_online_check_failure
+ *
+ */
+static bool handle_oneshot_online_check_failure(
+			struct connman_service *service,
+			enum connman_ipconfig_type type,
+			enum connman_service_state ipconfig_state,
+			struct online_check_state *online_check_state,
+			int err,
+			const char *message)
+{
+	const bool reschedule = true;
+
+	/* Simply indicate rescheduling another check is desired. */
+
+	DBG("online check mode is one-shot; requesting another check");
+
+	return reschedule;
+}
+
+/**
+ *  @brief
+ *    Handle the failed completion of an one-shot mode "online"
+ *    HTTP-based Internet reachability check for the specified network
+ *    service and IP configuration type for the "continuous" online
+ *    check mode.
+ *
+ *  This handles the completion of a failed continuous mode "online"
+ *  HTTP-based Internet reachability check for the specified network
+ *  service and IP configuration type for the "continuous" online check
+ *  mode. This effectively "bookends" an earlier
+ *  #__connman_service_wispr_start.
+ *
+ *  @param[in,out]  service             A pointer to the mutable service
+ *                                      for which to handle a
+ *                                      failed previously-requested
+ *                                      online check.
+ *  @param[in]      type                The IP configuration type for
+ *                                      which to handle a failed
+ *                                      previously-requested online
+ *                                      check.
+ *  @param[in]      ipconfig_state      The current @a type IP
+ *                                      configuration state for @a
+ *                                      service.
+ *  @param[in,out]  online_check_state  A pointer to the online check
+ *                                      state for @a service
+ *                                      associated with @a type.
+ *  @param[in]      err                 The error status associated with
+ *                                      the failed previously-requested
+ *                                      online check. This is expected
+ *                                      to be less than zero ('< 0').
+ *  @param[in]      message             A pointer to an immutable null-
+ *                                      terminated C string describing
+ *                                      the reason for the online
+ *                                      check failure.
+ *
+ *  @returns
+ *    True if another online check should be scheduled; otherwise,
+ *    false.
+ *
+ *  @sa handle_online_check_failure
+ *  @sa handle_continuous_online_check_failure
+ *
+ */
+static bool handle_continuous_online_check_failure(
+			struct connman_service *service,
+			enum connman_ipconfig_type type,
+			enum connman_service_state ipconfig_state,
+			struct online_check_state *online_check_state,
+			int err,
+			const char *message)
+{
+	bool reschedule = false;
+
+	/* Unconditionally increment and log the failure counter. */
+
+	online_check_counter_increment_and_log(service, type,
+		"failures", &online_check_state->failures);
+
+	/*
+	 * Ultimately, for successes, we are looking for a STRING of
+	 * SUSTAINED, BACK-TO-BACK successes to meet the successes
+	 * threshold. Consequently, any failure should reset the
+	 * corresponding success count back to zero (0).
+	 */
+	online_check_counter_reset(&online_check_state->successes);
+
+	/*
+	 * If this is the first failure, then reset the online check
+	 * interval to the initial, minimum value. Subsequent failures
+	 * will increment the interval on reschedule from here until the
+	 * maximum interval is hit.
+	 */
+	if (online_check_state->failures == 1)
+		online_check_state->interval = online_check_initial_interval;
+
+	DBG("failures threshold was met %u failures threshold is met %u "
+		"default %u",
+		online_check_failures_threshold_was_met(service),
+		online_check_failures_threshold_is_met(service),
+		connman_service_is_default(service));
+
+	/*
+	 * If the service HAD NOT previously-exceeded the failure
+	 * threshold AND failures meet or exceed the configured failure
+	 * threshold, then:
+	 *
+	 *	  1. Assert the failure threshold state.
+	 *	  2. Reset the success counters.
+	 *	  3. Attempt to downgrade the service IP configuration state
+	 *		 from ONLINE to READY.
+	 *	  4. Re-sort the network services.
+	 *	  5. Update the gateways accordingly.
+	 *
+	 * The failing service will be demoted until such time as it has a
+	 * configured number of successes, at which time, we will resort
+	 * again.
+	 *
+	 */
+	if (!online_check_failures_threshold_was_met(service) &&
+		online_check_failures_threshold_is_met(service)) {
+		online_check_failures_threshold_was_met_set(service);
+
+		continuous_online_check_log_failures_threshold_met(service);
+
+		online_check_successes_reset(service);
+
+		/*
+		 * Attempt to downgrade the service state from ONLINE to
+		 * READY.
+		 *
+		 * We attempt BOTH IPv4 and IPv6 IP configuration states since
+		 * the #online_check_failures_threshold_is_met predicate tells
+		 * us that both IP configurations have met the failures
+		 * threshold.
+		 */
+		service_downgrade_online_state(service);
+
+		set_error(service, CONNMAN_SERVICE_ERROR_ONLINE_CHECK_FAILED);
+
+		SERVICE_LIST_SORT();
+
+		__connman_gateway_update();
+	}
+
+	DBG("failures threshold was met %u, default %u",
+		online_check_failures_threshold_was_met(service),
+		connman_service_is_default(service));
+
+	/*
+	 * We only want to reschedule future online checks for
+	 * the default service or those that are in failure.
+	 */
+	if (connman_service_is_default(service) ||
+		online_check_failures_threshold_was_met(service))
+		reschedule = true;
+
+	return reschedule;
+}
+
+/**
+ *  @brief
+ *    Handle the failed completion of an "online" HTTP-based
+ *    Internet reachability check for the specified network service
+ *    and IP configuration type.
+ *
+ *  This handles the completion of a failed "online" HTTP-based
+ *  Internet reachability check for the specified network service and
+ *  IP configuration type. This effectively "bookends" an earlier
+ *  #__connman_service_wispr_start.
+ *
+ *  @param[in,out]  service             A pointer to the mutable service
+ *                                      for which to handle a
+ *                                      failed previously-requested
+ *                                      online check.
+ *  @param[in]      type                The IP configuration type for
+ *                                      which to handle a failed
+ *                                      previously-requested online
+ *                                      check.
+ *  @param[in]      ipconfig_state      The current @a type IP
+ *                                      configuration state for @a
+ *                                      service.
+ *  @param[in,out]  online_check_state  A pointer to the online check
+ *                                      state for @a service
+ *                                      associated with @a type.
+ *  @param[in]      oneshot             A Boolean indicating whether the
+ *                                      online check mode is
+ *                                      "one-shot" (true) or
+ *                                      "continuous" (false).
+ *  @param[in]      err                 The error status associated with
+ *                                      the failed previously-requested
+ *                                      online check. This is expected
+ *                                      to be less than zero ('< 0').
+ *  @param[in]      message             A pointer to an immutable null-
+ *                                      terminated C string describing
+ *                                      the reason for the online
+ *                                      check failure.
+ *
+ *  @returns
+ *    True if another online check should be scheduled; otherwise,
+ *    false.
+ *
+ *  @sa handle_online_check_success
+ *  @sa handle_oneshot_online_check_failure
+ *  @sa handle_continuous_online_check_failure
+ *
+ */
+static bool handle_online_check_failure(struct connman_service *service,
+				enum connman_ipconfig_type type,
+				enum connman_service_state ipconfig_state,
+				struct online_check_state *online_check_state,
+				bool oneshot,
+				int err,
+				const char *message)
+{
+	bool reschedule = false;
+
+	DBG("service %p (%s) type %d (%s) state %d (%s) "
+		"one-shot %u err %d message %s\n",
+		service,
+		connman_service_get_identifier(service),
+		type, __connman_ipconfig_type2string(type),
+		ipconfig_state, state2string(ipconfig_state),
+		oneshot, err, message ? message : "<null>");
+
+	/*
+	 * Regardless of online check mode, if this completion closure
+	 * was a failure with error status -ECANCELED, then it was canceled
+	 * by #__connman_wispr_cancel. Simply ignore it and DO NOT indicate
+	 * rescheduling another check is desired.
+	 */
+	if (err == -ECANCELED) {
+		DBG("online check was canceled; no action taken");
+
+		goto done;
+	}
+
+	/* Unconditionally log the failure, regardless of online check mode. */
+
+	online_check_log_failure(service, type, message);
+
+	/* Handle the failure according to the online check mode. */
+
+	if (oneshot)
+		reschedule = handle_oneshot_online_check_failure(
+						service,
+						type,
+						ipconfig_state,
+						online_check_state,
+						err,
+						message);
+	else
+		reschedule = handle_continuous_online_check_failure(
+						service,
+						type,
+						ipconfig_state,
+						online_check_state,
+						err,
+						message);
+
+done:
+	return reschedule;
+}
+
+/**
+ *  @brief
+ *    This completes an "online" HTTP-based Internet reachability
+ *    check for the specified network service and IP configuration
+ *    type.
+ *
+ *  This completes a failed or successful "online" HTTP-based Internet
+ *  reachability check for the specified network service and IP
+ *  configuration type. This effectively "bookends" an earlier
+ *  #__connman_service_wispr_start.
+ *
+ *  If "OnlineCheckMode" is "one-shot" and if @a success is asserted,
+ *  then the state for the specified IP configuration type is
+ *  transitioned to "online" and a future online check is scheduled
+ *  based on the current interval and the "OnlineCheckIntervalStyle"
+ *  setting.
+ *
+ *  Otherwise, if "OnlineCheckMode" is "continuous", then counters are
+ *  managed for the success or failure and state is managed and
+ *  tracked resulting in the potential demotion of the service,
+ *  placing it into a temporary failure state until such time as a
+ *  series of back-to-back online checks successfully complete. If the
+ *  service is a non-default after demotion and it is in failure state
+ *  or if it is the default service, then a future online check is
+ *  scheduled based on the current interval and the
+ *  "OnlineCheckIntervalStyle" setting.
+ *
+ *  @param[in,out]  service  A pointer to the mutable service for which
+ *                           to complete a previously-requested online
+ *                           check.
+ *  @param[in]      type     The IP configuration type for which to
+ *                           complete a previously-requested online
+ *                           check.
+ *  @param[in]      success  A Boolean indicating whether the previously-
+ *                           requested online check was successful.
+ *  @param[in]      err      The error status associated with previously-
+ *                           requested online check. This is expected
+ *                           to be zero ('0') if @a success is @a true
+ *                           and less than zero ('< 0') if @a success
+ *                           is @a false.
+ *  @param[in]      message  An optional pointer to an immutable null-
+ *                           terminated C string describing the reason
+ *                           for the online check failure.
+ *
+ *  @sa cancel_online_check
+ *  @sa start_online_check
+ *  @sa start_online_check_if_connected
+ *  @sa __connman_service_wispr_start
+ *  @sa handle_online_check_success
+ *  @sa handle_online_check_failure
+ *  @sa reschedule_online_check
+ *
+ */
+static void complete_online_check(struct connman_service *service,
+					enum connman_ipconfig_type type,
+					bool success,
+					int err,
+					const char *message)
+{
+	const bool oneshot = __connman_service_is_online_check_mode(
+		CONNMAN_SERVICE_ONLINE_CHECK_MODE_ONE_SHOT);
+	struct online_check_state *online_check_state;
+	enum connman_service_state ipconfig_state;
+	bool reschedule = false;
+
+	DBG("service %p (%s) type %d (%s) "
+		"success %u err %d message %s\n",
+		service,
+		connman_service_get_identifier(service),
+		type, __connman_ipconfig_type2string(type),
+		success, err, message ? message : "<null>");
+
+	if (type == CONNMAN_IPCONFIG_TYPE_IPV4) {
+		online_check_state = &service->online_check_state_ipv4;
+		ipconfig_state = service->state_ipv4;
+	} else if (type == CONNMAN_IPCONFIG_TYPE_IPV6) {
+		online_check_state = &service->online_check_state_ipv6;
+		ipconfig_state = service->state_ipv6;
+	} else
+		return;
+
+	if (success)
+		reschedule = handle_online_check_success(service,
+					 type,
+					 online_check_state,
+					 oneshot);
+	else
+		reschedule = handle_online_check_failure(service,
+					 type,
+					 ipconfig_state,
+					 online_check_state,
+					 oneshot,
+					 err,
+					 message);
+
+	DBG("reschedule online check %u", reschedule);
+
+	if (reschedule)
+		reschedule_online_check(service, type, online_check_state);
+	else
+		online_check_active_clear(service, type);
+}
+
+/**
+ *  @brief
+ *    Start HTTP-based Internet reachability probes if the specified
+ *    service is connected.
+ *
+ *  This attempts to start IPv4 or IPv6 HTTP-based Internet
+ *  reachability probes if the IPv4 state or IPv6 state is connected
+ *  (that is, "ready" or "online") and if the online check state is
+ *  not already active for the specified network service IP
+ *  configuration type.
+ *
+ *  @param[in,out]  service  A pointer to a mutable service on which
+ *                           to start "online" HTTP-based Internet
+ *                           reachability checks if the IP
+ *                           configuration state associated with @a
+ *                           type is "connected" (that is, "ready" or
+ *                           "online").
+ *  @param[in]      type     The IP configuration type for which to
+ *                           start the "online" HTTP-based Internet
+ *                           reachability checks.
+ *
+ *  @retval  0          If successful.
+ *  @retval  -EINVAL    If @a service is null or @a type is invalid.
+ *  @retval  -EPERM     If online checks are disabled via
+ *                      configuration.
+ *  @retval  -ENOTCONN  If @a service is not "connected" (that is,
+ *                      "ready" or "online").
+ *  @retval  -EALREADY  If online checks are already active for @a
+ *                      service.
+ *
+ *  @sa start_online_check
+ *  @sa start_online_check_if_connected_with_type
+ *
+ */
+static int start_online_check_if_connected_with_type(
+					struct connman_service *service,
+					enum connman_ipconfig_type type)
+{
+	int status = 0;
+
+	switch (type) {
+	case CONNMAN_IPCONFIG_TYPE_IPV4:
+	case CONNMAN_IPCONFIG_TYPE_IPV6:
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	if (!__connman_service_is_connected_state(service, type))
+		status = -ENOTCONN;
+	else
+		status = __connman_service_wispr_start(service, type);
+
+	return status;
+}
+
+/**
+ *  @brief
+ *    Start HTTP-based Internet reachability probes if the specified
+ *    service is connected.
+ *
+ *  This attempts to start IPv4 and/or IPv6 HTTP-based Internet
+ *  reachability probes if the IPv4 state or IPv6 state is connected
+ *  (that is, "ready" or "online").
+ *
+ *  @param[in,out]  service  A pointer to a mutable service on which
+ *                           to start "online" HTTP-based Internet
+ *                           reachability checks if the IPv4 or IPv6
+ *                           state is "connected" (that is, "ready" or
+ *                           "online").
+ *
+ *  @retval  0          If successful.
+ *  @retval  -EINVAL    If @a service is null or @a type is invalid.
+ *  @retval  -EPERM     If online checks are disabled via
+ *                      configuration.
+ *  @retval  -ENOTCONN  If @a service is not "connected" (that is,
+ *                      "ready" or "online").
+ *  @retval  -EALEADY   If online checks are already active for @a
+ *                      service.
+ *
+ *  @sa start_online_check
+ *  @sa start_online_check_if_connected_with_type
+ *
+ */
+static int start_online_check_if_connected(struct connman_service *service)
+{
+	int status4 = 0, status6 = 0;
+
+	DBG("service %p (%s) state4 %d (%s) state6 %d (%s) maybe start WISPr",
+		service,
+		connman_service_get_identifier(service),
+		service->state_ipv4, state2string(service->state_ipv4),
+		service->state_ipv6, state2string(service->state_ipv6));
+
+	if (!service)
+		return -EINVAL;
+
+	if (!online_check_is_enabled_check(service))
+		return -EPERM;
+
+	status4 = start_online_check_if_connected_with_type(service,
+			CONNMAN_IPCONFIG_TYPE_IPV4);
+
+	status6 = start_online_check_if_connected_with_type(service,
+			CONNMAN_IPCONFIG_TYPE_IPV6);
+
+	DBG("status4 %d (%s) status6 %d (%s)",
+		status4, strerror(-status4),
+		status6, strerror(-status6));
+
+	return (status4 < 0 ? status4 : status6);
+}
+
+/**
+ *  @brief
+ *    Start an "online" HTTP-based Internet reachability check for the
+ *    specified network service IP configuration type.
+ *
+ *  This attempts to start an "online" HTTP-based Internet
+ *  reachability check for the specified network service IP
+ *  configuration type.
+ *
+ *  @param[in,out]  service  A pointer to the mutable network service
+ *                           for which to start the "online"
+ *                           reachability check.
+ *  @param[in]      type     The IP configuration type for which the
+ *                           "online" reachability check is to be
+ *                           started.
+ *
+ *  @retval  0          If successful.
+ *  @retval  -EINVAL    If @a service is null or @a type is invalid.
+ *  @retval  -EALREADY  If online checks are already active for @a
+ *                      service.
+ *
+ *  @sa cancel_online_check
+ *  @sa start_online_check
+ *  @sa complete_online_check
+ *  @sa start_online_check_if_connected
+ *
+ */
+int __connman_service_wispr_start(struct connman_service *service,
+					enum connman_ipconfig_type type)
+{
+	int err;
+
+	DBG("service %p (%s) type %d (%s)",
+		service,
+		connman_service_get_identifier(service),
+		type, __connman_ipconfig_type2string(type));
+
+	if (!service)
+		return -EINVAL;
+
+	switch (type) {
+	case CONNMAN_IPCONFIG_TYPE_IPV4:
+	case CONNMAN_IPCONFIG_TYPE_IPV6:
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	if (online_check_is_active(service, type))
+		return -EALREADY;
+
+	/*
+	 * At this particular entry point, we assume to be starting an
+	 * "online" HTTP-based Internet reachability check
+	 * afresh. Consequently, set the check interval to initial.
+	 */
+	if (type == CONNMAN_IPCONFIG_TYPE_IPV4)
+		service->online_check_state_ipv4.interval =
+					online_check_initial_interval;
+	else if (type == CONNMAN_IPCONFIG_TYPE_IPV6)
+		service->online_check_state_ipv6.interval =
+					online_check_initial_interval;
+
+	err = __connman_wispr_start(service, type,
+			online_check_connect_timeout_ms, complete_online_check);
+	if (err < 0)
+		goto done;
+
+	/* Mark the online check state as active. */
+
+	online_check_active_set(service, type);
+
+done:
+	return err;
+}
+
+/**
+ *  @brief
+ *    Handle an update to the address(es) for the specified network
+ *    service and IP configuration type.
+ *
+ *  This attempts to handle an address change or update for the
+ *  specified network service and IP configuration type if and only if
+ *  it is connected (that is, #is_connected returns true) and it is
+ *  the default service (that is, has the default route).
+ *
+ *  If the service meets those criteria, then nameservers are
+ *  refreshed, an "online" HTTP-based Internet reachability check is
+ *  initiated, and a time-of-day synchronization is requested.
+ *
+ *  @param[in,out]  service  A pointer to the mutable network service
+ *                           for which there was an address change or
+ *                           update.
+ *  @param[in]      type     The IP configuration type for @a service
+ *                           for which there was an address change or
+ *                           update.
+ *
+ *  @sa nameserver_remove_all
+ *  @sa nameserver_add_all
+ *  @sa start_online_check
+ *  @sa __connman_timeserver_sync
+ *
+ */
 static void address_updated(struct connman_service *service,
 			enum connman_ipconfig_type type)
 {
+	DBG("service %p (%s) type %d (%s)",
+		service,
+		connman_service_get_identifier(service),
+		type, __connman_ipconfig_type2string(type));
+
 	if (is_connected(service->state) &&
-			service == connman_service_get_default()) {
+			connman_service_is_default(service)) {
 		nameserver_remove_all(service, type);
 		nameserver_add_all(service, type);
 		start_online_check(service, type);
@@ -1575,12 +4207,27 @@ static void reset_stats(struct connman_service *service)
 	g_timer_reset(service->stats_roaming.timer);
 }
 
+/**
+ *  @brief
+ *    Return the default service, if any.
+ *
+ *  This attempts to return a pointer to the default service (that is,
+ *  the service with the default route), if any.
+ *
+ *  @returns
+ *    A pointer to the mutable default service, if one exists;
+ *    otherwise, null.
+ *
+ */
 struct connman_service *connman_service_get_default(void)
 {
 	struct connman_service *service;
 
 	if (!service_list)
 		return NULL;
+
+	// Sorting is such that the default service is ALWAYS at the
+	// head of the service list, if one exists.
 
 	service = service_list->data;
 
@@ -1590,6 +4237,51 @@ struct connman_service *connman_service_get_default(void)
 	return service;
 }
 
+/**
+ *  @brief
+ *    Determine whether the specified service is the default service.
+ *
+ *  This determines whether the specified service is the default
+ *  service (that is, the service with the default route).
+ *
+ *  @param[in]  service  A pointer to the immutable service for which
+ *                       to determine whether it is the default
+ *                       network service.
+ *  @returns
+ *    True if the specified service is the default network service;
+ *    otherwise, false.
+ *
+ *  @sa connman_service_get_default
+ *
+ */
+static bool connman_service_is_default(const struct connman_service *service)
+{
+	if (!service)
+		return false;
+
+	return connman_service_get_default() == service;
+}
+
+/**
+ *  @brief
+ *    Determine whether the specified network interface index belongs
+ *    to the default service.
+ *
+ *  This determines whether or not the specified network interface
+ *  index belongs to the default service (that is, the service with
+ *  the default route).
+ *
+ *  @param[in]  index  The network interface to determine whether it
+ *                     belongs to the default service.
+ *
+ *  @returns
+ *    True if the specified index belongs to the default service;
+ *    otherwise, false.
+ *
+ *  @sa connman_service_get_default
+ *  @sa __connman_service_get_index
+ *
+ */
 bool __connman_service_index_is_default(int index)
 {
 	struct connman_service *service;
@@ -1602,41 +4294,65 @@ bool __connman_service_index_is_default(int index)
 	return __connman_service_get_index(service) == index;
 }
 
-static void start_wispr_when_connected(struct connman_service *service)
+static void service_log_default(const struct connman_service *service)
 {
-	if (!connman_setting_get_bool("EnableOnlineCheck")) {
-		connman_info("Online check disabled. "
-			"Default service remains in READY state.");
-		return;
-	}
+	g_autofree char *interface = NULL;
 
-	if (__connman_service_is_connected_state(service,
-			CONNMAN_IPCONFIG_TYPE_IPV4))
-		__connman_service_wispr_start(service,
-					CONNMAN_IPCONFIG_TYPE_IPV4);
+	interface = connman_service_get_interface(service);
 
-	if (__connman_service_is_connected_state(service,
-			CONNMAN_IPCONFIG_TYPE_IPV6))
-		__connman_service_wispr_start(service,
-					CONNMAN_IPCONFIG_TYPE_IPV6);
+	connman_info("Interface %s [ %s ] is the default",
+		interface,
+		__connman_service_type2string(service->type));
 }
 
-static void default_changed(void)
+static void default_changed(const char *function)
 {
 	struct connman_service *service = connman_service_get_default();
+
+	DBG("from %s()", function);
 
 	if (service == current_default)
 		return;
 
-	DBG("current default %p %s", current_default,
-		current_default ? current_default->identifier : "");
-	DBG("new default %p %s", service, service ? service->identifier : "");
+	DBG("current default %p (%s)", current_default,
+		connman_service_get_identifier(current_default));
+	DBG("new default %p (%s)", service, connman_service_get_identifier(service));
 
 	__connman_service_timeserver_changed(current_default, NULL);
+
+	/*
+	 * If there is a current default service, then it may either have
+	 * been temporarily:
+	 *
+	 *	 1. promoted as a failover from another senior service that
+	 *		was temporarily demoted
+	 *	 2. demoted as a failover to another junior service that is
+	 *		being temporarily promoted
+	 *
+	 * due to a continuous mode online check failure.
+	 *
+	 * Regardless, only services in online check failure or the default
+	 * service should be running online checks and only the default
+	 * service should be online. Consequently, make the appropriate
+	 * calls on the current default to ensure that is the case BEFORE
+	 * assigning the proposed new default as the current default.
+	 */
+	if (current_default) {
+		if (!online_check_failures_threshold_was_met(current_default) &&
+			current_default->error !=
+				CONNMAN_SERVICE_ERROR_ONLINE_CHECK_FAILED) {
+			cancel_online_check(current_default,
+				CONNMAN_IPCONFIG_TYPE_ALL);
+
+			service_downgrade_online_state(current_default);
+		}
+	}
 
 	current_default = service;
 
 	if (service) {
+		service_log_default(service);
+
 		if (service->hostname &&
 				connman_setting_get_bool("AllowHostnameUpdates"))
 			__connman_utsname_set_hostname(service->hostname);
@@ -1645,7 +4361,7 @@ static void default_changed(void)
 				connman_setting_get_bool("AllowDomainnameUpdates"))
 			__connman_utsname_set_domainname(service->domainname);
 
-		start_wispr_when_connected(service);
+		start_online_check_if_connected(service);
 
 		/*
 		 * Connect VPN automatically when new default service
@@ -1661,9 +4377,23 @@ static void default_changed(void)
 	__connman_notifier_default_changed(service);
 }
 
+static void service_log_state(const struct connman_service *service)
+{
+	g_autofree char *interface = NULL;
+
+	interface = connman_service_get_interface(service);
+
+	connman_info("Interface %s [ %s ] state is %s",
+		interface,
+		__connman_service_type2string(service->type),
+		state2string(service->state));
+}
+
 static void state_changed(struct connman_service *service)
 {
 	const char *str;
+
+	service_log_state(service);
 
 	__connman_notifier_service_state_changed(service, service->state);
 
@@ -2635,8 +5365,7 @@ static void append_properties(DBusMessageIter *dict, dbus_bool_t limited,
 	connman_dbus_dict_append_array(dict, "Nameservers.Configuration",
 				DBUS_TYPE_STRING, append_dnsconfig, service);
 
-	if (service->state == CONNMAN_SERVICE_STATE_READY ||
-			service->state == CONNMAN_SERVICE_STATE_ONLINE)
+	if (is_connected(service->state))
 		list = __connman_timeserver_get_all(service);
 	else
 		list = NULL;
@@ -2717,13 +5446,13 @@ void __connman_service_list_struct(DBusMessageIter *iter)
 	g_list_foreach(service_list, append_struct, iter);
 }
 
-bool __connman_service_is_hidden(struct connman_service *service)
+bool __connman_service_is_hidden(const struct connman_service *service)
 {
 	return service->hidden;
 }
 
 bool
-__connman_service_is_split_routing(struct connman_service *service)
+__connman_service_is_split_routing(const struct connman_service *service)
 {
 	return service->do_split_routing;
 }
@@ -2742,7 +5471,7 @@ bool __connman_service_index_is_split_routing(int index)
 	return __connman_service_is_split_routing(service);
 }
 
-int __connman_service_get_index(struct connman_service *service)
+int __connman_service_get_index(const struct connman_service *service)
 {
 	if (!service)
 		return -1;
@@ -2776,7 +5505,7 @@ void __connman_service_set_hostname(struct connman_service *service,
 		service->hostname = g_strdup(hostname);
 }
 
-const char *__connman_service_get_hostname(struct connman_service *service)
+const char *__connman_service_get_hostname(const struct connman_service *service)
 {
 	if (!service)
 		return NULL;
@@ -2799,7 +5528,7 @@ void __connman_service_set_domainname(struct connman_service *service,
 	domain_changed(service);
 }
 
-const char *connman_service_get_domainname(struct connman_service *service)
+const char *connman_service_get_domainname(const struct connman_service *service)
 {
 	if (!service)
 		return NULL;
@@ -2810,7 +5539,7 @@ const char *connman_service_get_domainname(struct connman_service *service)
 		return service->domainname;
 }
 
-const char *connman_service_get_dbuspath(struct connman_service *service)
+const char *connman_service_get_dbuspath(const struct connman_service *service)
 {
 	if (!service)
 		return NULL;
@@ -2818,7 +5547,7 @@ const char *connman_service_get_dbuspath(struct connman_service *service)
 	return service->path;
 }
 
-char **connman_service_get_nameservers(struct connman_service *service)
+char **connman_service_get_nameservers(const struct connman_service *service)
 {
 	if (!service)
 		return NULL;
@@ -2852,38 +5581,117 @@ char **connman_service_get_nameservers(struct connman_service *service)
 	return g_strdupv(connman_setting_get_string_list("FallbackNameservers"));
 }
 
-char **connman_service_get_timeservers_config(struct connman_service *service)
+const char * const *connman_service_get_timeservers_config(const struct connman_service *service)
 {
 	if (!service)
 		return NULL;
 
-	return service->timeservers_config;
+	return (const char * const *)service->timeservers_config;
 }
 
-char **connman_service_get_timeservers(struct connman_service *service)
+const char * const *connman_service_get_timeservers(const struct connman_service *service)
 {
 	if (!service)
 		return NULL;
 
-	return service->timeservers;
+	return (const char * const *)service->timeservers;
 }
 
-void connman_service_set_proxy_method(struct connman_service *service,
-					enum connman_service_proxy_method method)
+/**
+ *  @brief
+ *    Set the proxy method for the specified service.
+ *
+ *  This attempts to set the proxy method for the specified
+ *  service. If the service is null or if the service is hidden, no
+ *  action is taken. If specified, a handler will be invoked, with the
+ *  specified context, after setting the proxy method.
+ *
+ *  If the handler is specified and it returns true, following, a
+ *  D-Bus change notification should be sent for the service "Proxy"
+ *  property and, if requested by @a donotifier, the proxy changed
+ *  notifier chain will be run.
+ *
+ *  @param[in,out]  service     A pointer to the mutable network
+ *                              service for which to set the proxy
+ *                              method.
+ *  @param[in]      method      The network service proxy method to set
+ *                              on @a service.
+ *  @param[in]      donotifier  A Boolean indicating whether the proxy
+ *                              changed notifier chain should be run
+ *                              after @a method is set on @a service.
+ *  @param[in]      handler     An optional pointer to a handler that,
+ *                              if specified, will be invoked after @a
+ *                              method is set on @a service.
+ *  @param[in]      context     An optional pointer to immutable context
+ *                              that will be passed to @a handler,
+ *                              along with @a service and @a method.
+ *
+ *  @sa __connman_notifier_proxy_changed
+ *  @sa proxy_changed
+ *
+ *  @private
+ *
+ */
+static void service_set_proxy_method(struct connman_service *service,
+			enum connman_service_proxy_method method,
+			bool donotifier,
+			bool (*handler)(struct connman_service *service,
+				enum connman_service_proxy_method method,
+				const void *context),
+			const void *context)
 {
+	DBG("service %p (%s) method %d (%s) donotifier %u "
+		"handler %p, context %p",
+		service, connman_service_get_identifier(service),
+		method, proxymethod2string(method),
+		donotifier,
+		handler,
+		context);
+
 	if (!service || service->hidden)
 		return;
 
 	service->proxy = method;
 
+	if (handler != NULL)
+		if (handler(service, method, context) != true)
+			return;
+
 	proxy_changed(service);
 
-	if (method != CONNMAN_SERVICE_PROXY_METHOD_AUTO)
+	if (donotifier)
 		__connman_notifier_proxy_changed(service);
 }
 
+/**
+ *  @brief
+ *    Set the web proxy method of the specified service.
+ *
+ *  This attempts to set the web proxy method of the specified service
+ *  but will fail to do so if @a service is null or is hidden.
+ *
+ *  @param[in,out]  service  A pointer to the mutable network service
+ *                           for which to set the web proxy method.
+ *  @param[in]      method   The web proxy method to set.
+ *
+ *  @sa proxy_changed
+ *  @sa __connman_notifier_proxy_changed
+ *
+ */
+void connman_service_set_proxy_method(struct connman_service *service,
+					enum connman_service_proxy_method method)
+{
+	const bool donotifier = method != CONNMAN_SERVICE_PROXY_METHOD_AUTO;
+
+	service_set_proxy_method(service,
+		method,
+		donotifier,
+		NULL,
+		NULL);
+}
+
 enum connman_service_proxy_method connman_service_get_proxy_method(
-					struct connman_service *service)
+					const struct connman_service *service)
 {
 	if (!service)
 		return CONNMAN_SERVICE_PROXY_METHOD_UNKNOWN;
@@ -2909,7 +5717,7 @@ char **connman_service_get_proxy_excludes(struct connman_service *service)
 	return g_strdupv(service->excludes);
 }
 
-const char *connman_service_get_proxy_url(struct connman_service *service)
+const char *connman_service_get_proxy_url(const struct connman_service *service)
 {
 	if (!service)
 		return NULL;
@@ -2917,28 +5725,93 @@ const char *connman_service_get_proxy_url(struct connman_service *service)
 	return service->pac;
 }
 
-void __connman_service_set_proxy_autoconfig(struct connman_service *service,
-							const char *url)
+/**
+ *  @brief
+ *    A post-mutation handler for the service proxy method when the
+ *    method is #CONNMAN_SERVICE_PROXY_METHOD_AUTO.
+ *
+ *  @param[in,out]  service     A pointer to the mutable network
+ *                              service for which the proxy method was
+ *                              set.
+ *  @param[in]      method      The network service proxy method @a
+ *                              service was set to.
+ *  @param[in]      context     An pointer to immutable context
+ *                              that was passed, along with @a
+ *                              service, @a method, and this handler,
+ *                              to #service_set_proxy_method. For this
+ *                              handler, @a context is an optional
+ *                              null-terminated C string containing
+ *                              the service proxy auto-configuration
+ *                              (PAC) URL.
+ *
+ *  @returns
+ *    True if #service_set_proxy_method should continue with state
+ *    change notifications and processing proxy notifier changes after
+ *    the handler returns; otherwise, false.
+ *
+ *  @sa __connman_ipconfig_set_proxy_autoconfig
+ *  @sa service_set_proxy_method
+ *
+ *  @private
+ *
+ */
+static bool service_set_proxy_method_auto_handler(
+				struct connman_service *service,
+				enum connman_service_proxy_method method,
+				const void *context)
 {
-	if (!service || service->hidden)
-		return;
-
-	service->proxy = CONNMAN_SERVICE_PROXY_METHOD_AUTO;
+	const char * const url = context;
 
 	if (service->ipconfig_ipv4) {
 		if (__connman_ipconfig_set_proxy_autoconfig(
-			    service->ipconfig_ipv4, url) < 0)
-			return;
+				service->ipconfig_ipv4, url) < 0)
+			return false;
 	} else if (service->ipconfig_ipv6) {
 		if (__connman_ipconfig_set_proxy_autoconfig(
-			    service->ipconfig_ipv6, url) < 0)
-			return;
+				service->ipconfig_ipv6, url) < 0)
+			return false;
 	} else
-		return;
+		return false;
 
-	proxy_changed(service);
+	return true;
+}
 
-	__connman_notifier_proxy_changed(service);
+/**
+ *  @brief
+ *    Set the network service proxy method to # and proxy
+ *    auto-configuation (PAC) URL.
+ *
+ *  @param[in,out]  service  A pointer to the mutable network
+ *                           service for which to set the proxy
+ *                           method.
+ *  @param[in]  url          An optional pointer to the immutable
+ *                           null-terminated C string containing the
+ *                           proxy auto-configuration (PAC) URL.
+ *
+ *  @sa service_set_pac
+ *  @sa service_set_proxy_method
+ *  @sa service_set_proxy_method_auto_handler
+ *
+ */
+void __connman_service_set_proxy_autoconfig(struct connman_service *service,
+							const char *url)
+{
+	const bool dochanged = true;
+	const bool donotifier = true;
+
+	DBG("service %p (%s) url %p (%s)",
+		service,
+		connman_service_get_identifier(service),
+		url,
+		url ? url : "<null>");
+
+	service_set_pac(service, url, !dochanged);
+
+	service_set_proxy_method(service,
+		CONNMAN_SERVICE_PROXY_METHOD_AUTO,
+		donotifier,
+		service_set_proxy_method_auto_handler,
+		url);
 }
 
 const char *connman_service_get_proxy_autoconfig(struct connman_service *service)
@@ -3044,8 +5917,10 @@ int __connman_service_timeserver_remove(struct connman_service *service,
 	for (i = 0, j = 0; i < len; i++) {
 		if (g_strcmp0(service->timeservers[i], timeserver) != 0) {
 			servers[j] = g_strdup(service->timeservers[i]);
-			if (!servers[j])
+			if (!servers[j]) {
+				g_strfreev(servers);
 				return -ENOMEM;
+			}
 			j++;
 		}
 	}
@@ -3074,102 +5949,9 @@ void __connman_service_timeserver_changed(struct connman_service *service,
 void __connman_service_set_pac(struct connman_service *service,
 					const char *pac)
 {
-	if (service->hidden)
-		return;
-	g_free(service->pac);
-	service->pac = g_strdup(pac);
+	const bool dochanged = true;
 
-	proxy_changed(service);
-}
-
-void __connman_service_set_identity(struct connman_service *service,
-					const char *identity)
-{
-	if (service->immutable || service->hidden)
-		return;
-
-	g_free(service->identity);
-	service->identity = g_strdup(identity);
-
-	if (service->network)
-		connman_network_set_string(service->network,
-					"WiFi.Identity",
-					service->identity);
-}
-
-void __connman_service_set_anonymous_identity(struct connman_service *service,
-						const char *anonymous_identity)
-{
-	if (service->immutable || service->hidden)
-		return;
-
-	g_free(service->anonymous_identity);
-	service->anonymous_identity = g_strdup(anonymous_identity);
-
-	if (service->network)
-		connman_network_set_string(service->network,
-					"WiFi.AnonymousIdentity",
-					service->anonymous_identity);
-}
-
-void __connman_service_set_subject_match(struct connman_service *service,
-						const char *subject_match)
-{
-	if (service->immutable || service->hidden)
-		return;
-
-	g_free(service->subject_match);
-	service->subject_match = g_strdup(subject_match);
-
-	if (service->network)
-		connman_network_set_string(service->network,
-					"WiFi.SubjectMatch",
-					service->subject_match);
-}
-
-void __connman_service_set_altsubject_match(struct connman_service *service,
-						const char *altsubject_match)
-{
-	if (service->immutable || service->hidden)
-		return;
-
-	g_free(service->altsubject_match);
-	service->altsubject_match = g_strdup(altsubject_match);
-
-	if (service->network)
-		connman_network_set_string(service->network,
-					"WiFi.AltSubjectMatch",
-					service->altsubject_match);
-}
-
-void __connman_service_set_domain_suffix_match(struct connman_service *service,
-						const char *domain_suffix_match)
-{
-	if (service->immutable || service->hidden)
-		return;
-
-	g_free(service->domain_suffix_match);
-	service->domain_suffix_match = g_strdup(domain_suffix_match);
-
-	if (service->network)
-		connman_network_set_string(service->network,
-					"WiFi.DomainSuffixMatch",
-					service->domain_suffix_match);
-}
-
-void __connman_service_set_domain_match(struct connman_service *service,
-						const char *domain_match)
-{
-	if (service->immutable || service->hidden)
-		return;
-
-	g_free(service->domain_match);
-	service->domain_match = g_strdup(domain_match);
-
-	if (service->network)
-		connman_network_set_string(service->network,
-					"WiFi.DomainMatch",
-					service->domain_match);
+	service_set_pac(service, pac, dochanged);
 }
 
 void __connman_service_set_agent_identity(struct connman_service *service,
@@ -3241,9 +6023,6 @@ int __connman_service_check_passphrase(enum connman_service_security security,
 	return 0;
 }
 
-static void set_error(struct connman_service *service,
-					enum connman_service_error error);
-
 int __connman_service_set_passphrase(struct connman_service *service,
 					const char *passphrase)
 {
@@ -3270,12 +6049,12 @@ int __connman_service_set_passphrase(struct connman_service *service,
 
 	if (service->hidden_service &&
 			service->error == CONNMAN_SERVICE_ERROR_INVALID_KEY)
-		set_error(service, CONNMAN_SERVICE_ERROR_UNKNOWN);
+		clear_error(service);
 
 	return 0;
 }
 
-const char *__connman_service_get_passphrase(struct connman_service *service)
+const char *__connman_service_get_passphrase(const struct connman_service *service)
 {
 	if (!service)
 		return NULL;
@@ -3459,12 +6238,7 @@ static int update_proxy_configuration(struct connman_service *service,
 
 		break;
 	case CONNMAN_SERVICE_PROXY_METHOD_AUTO:
-		g_free(service->pac);
-
-		if (url && strlen(url) > 0)
-			service->pac = g_strstrip(g_strdup(url));
-		else
-			service->pac = NULL;
+		service_set_pac(service, url, false);
 
 		/* if we are connected:
 		   - if service->pac == NULL
@@ -3609,21 +6383,6 @@ int __connman_service_reset_ipconfig(struct connman_service *service,
 	return err;
 }
 
-void __connman_service_wispr_start(struct connman_service *service,
-					enum connman_ipconfig_type type)
-{
-	DBG("service %p type %s", service, __connman_ipconfig_type2string(type));
-
-	if (type == CONNMAN_IPCONFIG_TYPE_IPV4)
-		service->online_check_interval_ipv4 =
-					online_check_initial_interval;
-	else
-		service->online_check_interval_ipv6 =
-					online_check_initial_interval;
-
-	__connman_wispr_start(service, type);
-}
-
 static DBusMessage *set_property(DBusConnection *conn,
 					DBusMessage *msg, void *user_data)
 {
@@ -3667,7 +6426,7 @@ static DBusMessage *set_property(DBusConnection *conn,
 			 * have the same effect as user connecting the VPN =
 			 * clear previous error and change state to idle.
 			 */
-			set_error(service, CONNMAN_SERVICE_ERROR_UNKNOWN);
+			clear_error(service);
 
 			if (service->state == CONNMAN_SERVICE_STATE_FAILURE) {
 				service->state = CONNMAN_SERVICE_STATE_IDLE;
@@ -3704,6 +6463,7 @@ static DBusMessage *set_property(DBusConnection *conn,
 
 		if (gw && strlen(gw))
 			__connman_service_nameserver_del_routes(service,
+						gw,
 						CONNMAN_IPCONFIG_TYPE_ALL);
 
 		dbus_message_iter_recurse(&value, &entry);
@@ -3748,7 +6508,7 @@ static DBusMessage *set_property(DBusConnection *conn,
 		nameserver_add_all(service, CONNMAN_IPCONFIG_TYPE_ALL);
 		dns_configuration_changed(service);
 
-		start_wispr_when_connected(service);
+		start_online_check_if_connected(service);
 
 		service_save(service);
 	} else if (g_str_equal(name, "Timeservers.Configuration")) {
@@ -3941,10 +6701,48 @@ static DBusMessage *set_property(DBusConnection *conn,
 	return g_dbus_create_reply(msg, DBUS_TYPE_INVALID);
 }
 
+static void service_log_error(const struct connman_service *service,
+					enum connman_service_error error)
+{
+	g_autofree char *interface = NULL;
+
+	interface = connman_service_get_interface(service);
+
+	connman_warn("Interface %s [ %s ] error \"%s\"",
+		interface,
+		__connman_service_type2string(service->type),
+		error2string(error));
+}
+
+/**
+ *  @brief
+ *    Set the specified network service "Error" property.
+ *
+ *  This sets the specified network service "Error" property to the
+ *  provided value.
+ *
+ *  @note
+ *    This function results in a D-Bus property changed signal for the
+ *    network service "Error" property.
+ *
+ *  @param[in,out]  service  A pointer to the mutable network service
+ *                           for which to set the "Error" property.
+ *  @param[in]      error    The error value to set.
+ *
+ *  @sa clear_error
+ *
+ */
 static void set_error(struct connman_service *service,
 					enum connman_service_error error)
 {
-	const char *str;
+	const char *str = error2string(error);
+
+	if (!str)
+		str = "";
+
+	DBG("service %p (%s) error %d (%s)",
+		service, connman_service_get_identifier(service),
+		error, str);
 
 	if (service->error == error)
 		return;
@@ -3954,17 +6752,39 @@ static void set_error(struct connman_service *service,
 	if (!service->path)
 		return;
 
+	if (error != CONNMAN_SERVICE_ERROR_UNKNOWN)
+		service_log_error(service, error);
+
 	if (!allow_property_changed(service))
 		return;
-
-	str = error2string(service->error);
-
-	if (!str)
-		str = "";
 
 	connman_dbus_property_changed_basic(service->path,
 				CONNMAN_SERVICE_INTERFACE, "Error",
 				DBUS_TYPE_STRING, &str);
+}
+
+/**
+ *  @brief
+ *    Clear or reset the specified network service "Error" property.
+ *
+ *  This sets the specified network service "Error" property to the
+ *  initialization value of #CONNMAN_SERVICE_ERROR_UNKNOWN,
+ *  effectively clearing or resetting the property.
+ *
+ *  @note
+ *    This function results in a D-Bus property changed signal for the
+ *    network service "Error" property.
+ *
+ *  @param[in,out]  service  A pointer to the mutable network service
+ *                           for which to clear or reset the "Error"
+ *                           property.
+ *
+ *  @sa set_error
+ *
+ */
+static void clear_error(struct connman_service *service)
+{
+	set_error(service, CONNMAN_SERVICE_ERROR_UNKNOWN);
 }
 
 static void remove_timeout(struct connman_service *service)
@@ -3982,12 +6802,6 @@ static void reply_pending(struct connman_service *service, int error)
 	if (service->pending) {
 		connman_dbus_reply_pending(service->pending, error, NULL);
 		service->pending = NULL;
-	}
-
-	if (service->provider_pending) {
-		connman_dbus_reply_pending(service->provider_pending,
-				error, service->path);
-		service->provider_pending = NULL;
 	}
 }
 
@@ -4014,7 +6828,7 @@ static DBusMessage *clear_property(DBusConnection *conn,
 							DBUS_TYPE_INVALID);
 
 	if (g_str_equal(name, "Error")) {
-		set_error(service, CONNMAN_SERVICE_ERROR_UNKNOWN);
+		clear_error(service);
 
 		__connman_service_clear_error(service);
 		service_complete(service);
@@ -4358,7 +7172,7 @@ static gboolean run_vpn_auto_connect(gpointer data) {
 		is_connected(def_service->state))) {
 
 		DBG("stopped, default service %s connected %d",
-			def_service ? def_service->identifier : "NULL",
+			connman_service_get_identifier(def_service),
 			def_service ? is_connected(def_service->state) : -1);
 		goto out;
 	}
@@ -4460,30 +7274,6 @@ static void vpn_auto_connect(void)
 
 	vpn_autoconnect_id =
 		g_idle_add(run_vpn_auto_connect, NULL);
-}
-
-bool
-__connman_service_is_provider_pending(struct connman_service *service)
-{
-	if (!service)
-		return false;
-
-	if (service->provider_pending)
-		return true;
-
-	return false;
-}
-
-void __connman_service_set_provider_pending(struct connman_service *service,
-							DBusMessage *msg)
-{
-	if (service->provider_pending) {
-		DBG("service %p provider pending msg %p already exists",
-			service, service->provider_pending);
-		return;
-	}
-
-	service->provider_pending = msg;
 }
 
 static void check_pending_msg(struct connman_service *service)
@@ -4715,46 +7505,186 @@ static bool check_suitable_state(enum connman_service_state a,
 	return a == b;
 }
 
-static void downgrade_state(struct connman_service *service)
+/**
+ *  @brief
+ *    Downgrade the service IP configuration state from "online" to
+ *    "ready".
+ *
+ *  This attempts to downgrade the specified IP configuration state of
+ *  the specified service to "ready" if it is "online".
+ *
+ *  @param[in,out]  service  A pointer to the mutable service whose IP
+ *                           configuration state, if
+ *                           #CONNMAN_SERVICE_STATE_ONLINE, is to be
+ *                           downgraded to
+ *                           #CONNMAN_SERVICE_STATE_READY.
+ *  @param[in]      state    The current IP configuration state of @a
+ *                           service.
+ *  @param[in]      type     The IP configuration type of @a service to
+ *                           try to downgrade.
+ *
+ *  @returns
+ *    True if the service state was downgraded for the specified IP
+ *    configuration type; otherwise, false.
+ *
+ *  @sa service_downgrade_online_state
+ *  @sa service_downgrade_online_state_if_default
+ *
+ */
+static bool service_ipconfig_downgrade_online_state(
+					struct connman_service *service,
+					enum connman_service_state state,
+					enum connman_ipconfig_type type)
 {
 	if (!service)
-		return;
+		return false;
 
-	DBG("service %p state4 %d state6 %d", service, service->state_ipv4,
-						service->state_ipv6);
+	DBG("service %p (%s) type %d (%s) state %d (%s)",
+		service,
+		connman_service_get_identifier(service),
+		type, __connman_ipconfig_type2string(type),
+		state, state2string(state));
 
-	if (service->state_ipv4 == CONNMAN_SERVICE_STATE_ONLINE)
+	if (is_online(state)) {
 		__connman_service_ipconfig_indicate_state(service,
 						CONNMAN_SERVICE_STATE_READY,
-						CONNMAN_IPCONFIG_TYPE_IPV4);
+						type);
 
-	if (service->state_ipv6 == CONNMAN_SERVICE_STATE_ONLINE)
-		__connman_service_ipconfig_indicate_state(service,
-						CONNMAN_SERVICE_STATE_READY,
-						CONNMAN_IPCONFIG_TYPE_IPV6);
+		return true;
+	}
+
+	return false;
 }
 
-static void apply_relevant_default_downgrade(struct connman_service *service)
+/**
+ *  @brief
+ *    Downgrade the service IPv4 and IPv6 states from "online" to
+ *    "ready".
+ *
+ *  This attempts to downgrade the IPv4 and IPv6 states of the
+ *  specified service to "ready" if they are "online".
+ *
+ *  @param[in,out]  service  A pointer to the mutable service whose IPv4
+ *                           and IPv6 states, if
+ *                           #CONNMAN_SERVICE_STATE_ONLINE, are to be
+ *                           downgraded to
+ *                           #CONNMAN_SERVICE_STATE_READY.
+ *
+ *  @returns
+ *    True if either IPv4 or IPv6 service state was downgraded;
+ *    otherwise, false.
+ *
+ *  @sa service_ipconfig_downgrade_online_state
+ *  @sa service_downgrade_online_state_if_default
+ *
+ */
+static bool service_downgrade_online_state(struct connman_service *service)
+{
+	bool ipv4_downgraded = false;
+	bool ipv6_downgraded = false;
+
+	if (!service)
+		return false;
+
+	DBG("service %p (%s) state4 %d (%s) state6 %d (%s)",
+		service,
+		connman_service_get_identifier(service),
+		service->state_ipv4, state2string(service->state_ipv4),
+		service->state_ipv6, state2string(service->state_ipv6));
+
+	ipv4_downgraded = service_ipconfig_downgrade_online_state(service,
+								 service->state_ipv4,
+								 CONNMAN_IPCONFIG_TYPE_IPV4);
+
+	ipv6_downgraded = service_ipconfig_downgrade_online_state(service,
+								 service->state_ipv6,
+								 CONNMAN_IPCONFIG_TYPE_IPV6);
+
+	return ipv4_downgraded || ipv6_downgraded;
+}
+
+/**
+ *  @brief
+ *    Downgrade the service IPv4 and IPv6 states from "online" to
+ *    "ready" if and only if the service is the default service and it
+ *    is "online".
+ *
+ *  This attempts to downgrade the IPv4 and IPv6 states of the
+ *  specified service to "ready" if and only if the service is the
+ *  default service and its combined service state is "online".
+ *
+ *  @param[in,out]  service  A pointer to the mutable service whose IPv4
+ *                           and IPv6 states, if it is the default
+ *                           service and its combined service state is
+ *                           #CONNMAN_SERVICE_STATE_ONLINE, are to be
+ *                           downgraded to
+ *                           #CONNMAN_SERVICE_STATE_READY.
+ *
+ *  @returns
+ *    True if either IPv4 or IPv6 service state was downgraded;
+ *    otherwise, false.
+ *
+ *  @sa service_ipconfig_downgrade_online_state
+ *  @sa service_downgrade_online_state
+ *
+ */
+static bool service_downgrade_online_state_if_default(struct connman_service *service)
 {
 	struct connman_service *def_service;
 
 	def_service = connman_service_get_default();
 	if (!def_service || def_service != service ||
-		def_service->state != CONNMAN_SERVICE_STATE_ONLINE)
-		return;
+		!is_online(def_service->state))
+		return false;
 
-	downgrade_state(def_service);
+	return service_downgrade_online_state(def_service);
 }
 
-static void switch_default_service(struct connman_service *default_service,
-		struct connman_service *downgrade_service)
+/**
+ *  @brief
+ *    Switch the order of the two specified services in the network
+ *    service list.
+ *
+ *  This attempts to switch the order of the two specified services in
+ *  the ntework service list. This has the side-effect of potentially
+ *  downgrading the state of @a demoted_service from "online" to
+ *  "ready" if it is "online" and is the default service and
+ *  downgrading the state of @a promoted_service from "online" to
+ *  "ready".
+ *
+ *  @note
+ *    If the two services have pointer equivalence or are already in
+ *    the specified order, there is no state downgrade of @a
+ *    promoted_service.
+ *
+ *  @param[in,out]  demoted_service   A pointer to the mutable service
+ *                                    to demote in the network service
+ *                                    list to @b after @a
+ *                                    promoted_service.
+ *  @param[in,out]  promoted_service  A pointer to the mutable service
+ *                                    to promote in the network service
+ *                                    list to @b before @a
+ *                                    demoted_service.
+ *
+ */
+static void switch_service_order(struct connman_service *demoted_service,
+		struct connman_service *promoted_service)
 {
 	struct connman_service *service;
 	GList *src, *dst;
 
-	apply_relevant_default_downgrade(default_service);
-	src = g_list_find(service_list, downgrade_service);
-	dst = g_list_find(service_list, default_service);
+	DBG("demoted_service %p (%s) default %u promoted_sevice %p (%s) default %u",
+		demoted_service,
+		connman_service_get_identifier(demoted_service),
+		connman_service_is_default(demoted_service),
+		promoted_service,
+		connman_service_get_identifier(promoted_service),
+		connman_service_is_default(promoted_service));
+
+	service_downgrade_online_state_if_default(demoted_service);
+
+	src = g_list_find(service_list, promoted_service);
+	dst = g_list_find(service_list, demoted_service);
 
 	/* Nothing to do */
 	if (src == dst || src->next == dst)
@@ -4764,7 +7694,7 @@ static void switch_default_service(struct connman_service *default_service,
 	service_list = g_list_delete_link(service_list, src);
 	service_list = g_list_insert_before(service_list, dst, service);
 
-	downgrade_state(downgrade_service);
+	service_downgrade_online_state(promoted_service);
 }
 
 static struct _services_notify {
@@ -4842,6 +7772,15 @@ static gboolean service_send_changed(gpointer data)
 	return FALSE;
 }
 
+/**
+ *  @brief
+ *    Schedule a D-Bus "ServicesChanged" signal at 100 milliseconds
+ *    from now.
+ *
+ *  @sa service_send_changed
+ *  @sa service_list_sort
+ *
+ */
 static void service_schedule_changed(void)
 {
 	if (services_notify->id != 0)
@@ -4945,11 +7884,11 @@ int __connman_service_move(struct connman_service *service,
 	 * is triggered via downgrading it - if relevant - to state ready.
 	 */
 	if (before)
-		switch_default_service(target, service);
+		switch_service_order(target, service);
 	else
-		switch_default_service(service, target);
+		switch_service_order(service, target);
 
-	__connman_connection_update_gateway();
+	__connman_gateway_update();
 
 	service_schedule_changed();
 
@@ -5013,7 +7952,8 @@ static DBusMessage *reset_counters(DBusConnection *conn,
 
 static void service_schedule_added(struct connman_service *service)
 {
-	DBG("service %p", service);
+	DBG("service %p (%s)",
+		service, connman_service_get_identifier(service));
 
 	g_hash_table_remove(services_notify->remove, service->path);
 	g_hash_table_replace(services_notify->add, service->path, service);
@@ -5082,7 +8022,7 @@ static void service_free(gpointer user_data)
 	struct connman_service *service = user_data;
 	char *path = service->path;
 
-	DBG("service %p", service);
+	DBG("service %p (%s)", service, connman_service_get_identifier(service));
 
 	reply_pending(service, ENOENT);
 
@@ -5094,13 +8034,16 @@ static void service_free(gpointer user_data)
 	__connman_notifier_service_remove(service);
 	service_schedule_removed(service);
 
+	cancel_online_check(service, CONNMAN_IPCONFIG_TYPE_ALL);
+
 	__connman_wispr_stop(service);
+
 	stats_stop(service);
 
 	service->path = NULL;
 
 	if (path) {
-		__connman_connection_update_gateway();
+		__connman_gateway_update();
 
 		g_dbus_unregister_interface(connection, path,
 						CONNMAN_SERVICE_INTERFACE);
@@ -5308,11 +8251,11 @@ void connman_service_unref_debug(struct connman_service *service,
 
 static gint service_compare(gconstpointer a, gconstpointer b);
 
-static gint service_compare_vpn(struct connman_service *a,
-						struct connman_service *b)
+static gint service_compare_vpn(const struct connman_service *a,
+						const struct connman_service *b)
 {
 	struct connman_provider *provider;
-	struct connman_service *service;
+	const struct connman_service *service;
 	struct connman_service *transport;
 	const char *ident;
 	bool reverse;
@@ -5340,8 +8283,35 @@ static gint service_compare_vpn(struct connman_service *a,
 	return service_compare(transport, service);
 }
 
-static gint service_compare_preferred(struct connman_service *service_a,
-					struct connman_service *service_b)
+/**
+ *  @brief
+ *    Compare two network services against the @a
+ *    PreferredTechnologies priority list.
+ *
+ *  This compares the two specified network services, by their
+ *  technology type, against the @a PreferredTechnologies priority
+ *  list.
+ *
+ *  @param[in]  service_a  A pointer to the first immutable service
+ *                         to compare by its technology type with the
+ *                         @a PreferredTechnologies priority list.
+ *  @param[in]  service_b  A pointer to the second immutable service
+ *                         to compare by its technology type with the
+ *                         @a PreferredTechnologies priority list.
+ *
+ *  @retval   0  If the @a PreferredTechnologies configuration is empty
+ *               or if neither service type matches a technology type
+ *               in the @a PreferredTechnologies list.
+ *  @retval  -1  If @a service_a type matches a technology type
+ *               in the @a PreferredTechnologies list and should sort
+ *               @b before @a service_b.
+ *  @retval   1  If @a service_b type matches a technology type
+ *               in the @a PreferredTechnologies list and should sort
+ *               @b before @a service_a.
+ *
+ */
+static gint service_compare_preferred(const struct connman_service *service_a,
+					const struct connman_service *service_b)
 {
 	unsigned int *tech_array;
 	int i;
@@ -5359,10 +8329,37 @@ static gint service_compare_preferred(struct connman_service *service_a,
 	return 0;
 }
 
+/**
+ *  @brief
+ *    Compare two network services against one another.
+ *
+ *  This compares the two specified network services.
+ *
+ *  Services are compared with the following sort criteria:
+ *
+ *    1. State
+ *    2. Favorite status
+ *    3. Type
+ *    4. Strength
+ *    5. Name
+ *
+ *  @param[in]  a  A pointer to the first immutable service
+ *                 to compare.
+ *  @param[in]  b  A pointer to the second immutable service
+ *                 to compare.
+ *
+ *  @retval    0  If service @a a and @a b are equivalent.
+ *  @retval  < 0  If service @a a should sort @b before service @a b.
+ *  @retval  > 0  If service @a b should sort @b before service @a a.
+ *
+ *  @sa service_compare_preferred
+ *  @sa __connman_service_compare
+ *
+ */
 static gint service_compare(gconstpointer a, gconstpointer b)
 {
-	struct connman_service *service_a = (void *) a;
-	struct connman_service *service_b = (void *) b;
+	const struct connman_service *service_a = (const void *) a;
+	const struct connman_service *service_b = (const void *) b;
 	enum connman_service_state state_a, state_b;
 	bool a_connected, b_connected;
 	gint strength;
@@ -5372,8 +8369,30 @@ static gint service_compare(gconstpointer a, gconstpointer b)
 	a_connected = is_connected(state_a);
 	b_connected = is_connected(state_b);
 
+	/*
+	 * If both services are connected (that is, "ready" or "online"),
+	 * then further sort by whether the services are VPN type, then
+	 * service order if there is VPN equivalence, and then by their
+	 * preferred technology status.
+	 */
 	if (a_connected && b_connected) {
 		int rval;
+
+		/*
+		 * If at this point the services are still comparing as
+		 * equivalent, then use online check failure status, giving
+		 * priority to the service that has not met the failure
+		 * threshold.
+		 */
+		if (!online_check_failures_threshold_was_met(service_a) &&
+			online_check_failures_threshold_was_met(service_b)) {
+			return -1;
+		}
+
+		if (online_check_failures_threshold_was_met(service_a) &&
+			!online_check_failures_threshold_was_met(service_b)) {
+			return 1;
+		}
 
 		/* Compare the VPN transport and the service */
 		if ((service_a->type == CONNMAN_SERVICE_TYPE_VPN ||
@@ -5395,13 +8414,22 @@ static gint service_compare(gconstpointer a, gconstpointer b)
 			return rval;
 	}
 
+	/*
+	 * If at this point the services are still comparing as
+	 * equilvalent, then check whether their combined states are
+	 * different. If they are, then prefer the service that is
+	 * "online" to that which is only "ready", then prefer @a a being
+	 * connected versus @a b being connected, and, finally, then
+	 * prefer @a a being in the process of connecting to @a b being in
+	 * the process of connecting.
+	 */
 	if (state_a != state_b) {
 		if (a_connected && b_connected) {
 			/* We prefer online over ready state */
-			if (state_a == CONNMAN_SERVICE_STATE_ONLINE)
+			if (is_online(state_a))
 				return -1;
 
-			if (state_b == CONNMAN_SERVICE_STATE_ONLINE)
+			if (is_online(state_b))
 				return 1;
 		}
 
@@ -5416,12 +8444,26 @@ static gint service_compare(gconstpointer a, gconstpointer b)
 			return 1;
 	}
 
+	/*
+	 * If at this point the services are still comparing as
+	 * equivalent, then use favorite status, giving priority to @a a
+	 * as a favorite versus @a b as a favorite.
+	 */
 	if (service_a->favorite && !service_b->favorite)
 		return -1;
 
 	if (!service_a->favorite && service_b->favorite)
 		return 1;
 
+	/*
+	 * If at this point the services are still comparing as
+	 * equivalent, then check whether their types are different. If
+	 * they are, then compare their types. First, against the
+	 * PreferredTechnologies priority list and then by an internal
+	 * prioritization favoring Ethernet over Wi-Fi, Wi-Fi over
+	 * Cellular, Cellular over Bluetooth, Bluetooth over VPN, and VPN
+	 * over Gadget (that is, USB Ethernet).
+	 */
 	if (service_a->type != service_b->type) {
 		int rval;
 
@@ -5460,21 +8502,70 @@ static gint service_compare(gconstpointer a, gconstpointer b)
 			return 1;
 	}
 
+	/*
+	 * If at this point the services are still comparing as
+	 * equivalent, then check their strengths.
+	 */
 	strength = (gint) service_b->strength - (gint) service_a->strength;
 	if (strength)
 		return strength;
 
+	/*
+	 * Finally, if at this point the services are still comparing as
+	 * equivalent, then check their names.
+	 */
 	return g_strcmp0(service_a->name, service_b->name);
 }
 
-static void service_list_sort(void)
+/**
+ *  @brief
+ *    Sort the network services list and schedule a "ServicesChanged"
+ *    D-Bus signal.
+ *
+ *  This attempts to sort, if non-null and has more than one element,
+ *  the network services list. On completion of the sort, a D-Bus
+ *  "ServicesChanged" signal is scheduled.
+ *
+ *  @param[in]  function  A pointer to an immutable null-terminated
+ *                        C string containing the function name to
+ *                        which the call to this function should be
+ *                        attributed.
+ *
+ *  @sa service_compare
+ *  @sa service_compare_preferred
+ *  @sa service_schedule_changed
+ *
+ */
+static void service_list_sort(const char *function)
 {
+	DBG("from %s()", function);
+
 	if (service_list && service_list->next) {
 		service_list = g_list_sort(service_list, service_compare);
 		service_schedule_changed();
 	}
 }
 
+/**
+ *  @brief
+ *    Compare two network services against one another.
+ *
+ *  This compares the two specified network services.
+ *
+ *  @param[in]  a  A pointer to the first immutable service
+ *                 to compare.
+ *  @param[in]  b  A pointer to the second immutable service
+ *                 to compare.
+ *
+ *  @retval    0  If service @a a and @a b are equivalent.
+ *  @retval  < 0  If service @a a should sort @b before service @a b.
+ *  @retval  > 0  If service @a b should sort @b before service @a a.
+ *
+ *  @sa service_compare
+ *  @sa service_compare_preferred
+ *  @sa service_list_sort
+ *
+ */
 int __connman_service_compare(const struct connman_service *a,
 					const struct connman_service *b)
 {
@@ -5487,7 +8578,7 @@ int __connman_service_compare(const struct connman_service *a,
  *
  * Get the type of service
  */
-enum connman_service_type connman_service_get_type(struct connman_service *service)
+enum connman_service_type connman_service_get_type(const struct connman_service *service)
 {
 	if (!service)
 		return CONNMAN_SERVICE_TYPE_UNKNOWN;
@@ -5501,7 +8592,7 @@ enum connman_service_type connman_service_get_type(struct connman_service *servi
  *
  * Get network interface of service
  */
-char *connman_service_get_interface(struct connman_service *service)
+char *connman_service_get_interface(const struct connman_service *service)
 {
 	int index;
 
@@ -5526,6 +8617,104 @@ __connman_service_get_network(struct connman_service *service)
 		return NULL;
 
 	return service->network;
+}
+
+/**
+ *  @brief
+ *    Return the current service count.
+ *
+ *  @returns
+ *    The current service count.
+ *
+ */
+static size_t service_get_count(void)
+{
+	return service_list ? g_list_length(service_list) : 0;
+}
+
+/**
+ *  @brief
+ *    Get the route metric/priority for the specified service.
+ *
+ *  This attempts to get the route metric/priority for the specified
+ *  service based on the current service and services state.
+ *
+ *  If the service is the default or if it is the only service, then
+ *  the metric is zero (0). Otherwise, a low-priority metric (metric >
+ *  0) unique to @a service and its underlying network interface is
+ *  computed and returned.
+ *
+ *  @param[in]      service  A pointer to the immutable service for
+ *                           which to get the route metric/priority.
+ *  @param[in,out]  metric   A pointer to storage for the route
+ *                           metric/priority, populated with the route
+ *                           metric/priority on success.
+ *
+ *  @retval  0        If successful.
+ *  @retval  -EINVAL  If @a service or @a metric are null.
+ *  @retval  -ENXIO   If the network interface index associated with
+ *                    @a service is invalid.
+ *
+ *  @sa connman_service_is_default
+ *
+ */
+int __connman_service_get_route_metric(const struct connman_service *service,
+				uint32_t *metric)
+{
+	static const uint32_t metric_base = UINT32_MAX;
+	static const uint32_t metric_ceiling = (1 << 20);
+	static const uint32_t metric_index_step = (1 << 10);
+	int index;
+
+	DBG("");
+
+	if (!service || !metric)
+		return -EINVAL;
+
+	DBG("service %p (%s) metric %p",
+		service, connman_service_get_identifier(service),
+		metric);
+
+	index = __connman_service_get_index(service);
+	if (index < 0)
+		return -ENXIO;
+
+	/*
+	 * The algorithm uses the network interface index since it is
+	 * assumed to be stable for the uptime of the network interface
+	 * and, consequently, the potential maximum lifetime of the route.
+	 *
+	 * The algorithm establishes UINT32_MAX as the metric base (the
+	 * lowest possible priority) and a somewhat-arbitrary 2^20 as the
+	 * ceiling (to keep metrics out of a range that might be used by
+	 * other applications). The metric is then adjusted in increments
+	 * of 1,024 (2^10) from the base, but less than the ceiling, by
+	 * multiplying the increment by the network interface index. This
+	 * is easy and simple to compute and is invariant on service
+	 * order.
+	 *
+	 * In the fullness of time, the "rule of least astonishment" for
+	 * Connection Manager might be that low priority metrics follow
+	 * the service order with the default service always having metric
+	 * zero (0) and lowest priority metric assigned to the lowest
+	 * priority service, etc. Achieving this would require having
+	 * access to APIs (such as '__connman_service_get_count()' and
+	 * '__connman_service_get_order(service)') that expose a
+	 * strictly-in/decreasing service order with no duplicates. Today,
+	 * there is no such API nor is there such a durable service order
+	 * meeting that mathematical requirement.
+	 */
+
+	if (service_get_count() <= 1 || connman_service_is_default(service))
+		*metric = 0;
+	else
+		*metric = MAX(metric_ceiling,
+					metric_base -
+					(index * metric_index_step));
+
+	DBG("metric %u", *metric);
+
+	return 0;
 }
 
 struct connman_ipconfig *
@@ -5558,7 +8747,7 @@ __connman_service_get_ipconfig(struct connman_service *service, int family)
 
 }
 
-bool __connman_service_is_connected_state(struct connman_service *service,
+bool __connman_service_is_connected_state(const struct connman_service *service,
 					enum connman_ipconfig_type type)
 {
 	if (!service)
@@ -5579,7 +8768,7 @@ bool __connman_service_is_connected_state(struct connman_service *service,
 	return false;
 }
 enum connman_service_security __connman_service_get_security(
-				struct connman_service *service)
+				const struct connman_service *service)
 {
 	if (!service)
 		return CONNMAN_SERVICE_SECURITY_UNKNOWN;
@@ -5587,7 +8776,7 @@ enum connman_service_security __connman_service_get_security(
 	return service->security;
 }
 
-const char *__connman_service_get_phase2(struct connman_service *service)
+const char *__connman_service_get_phase2(const struct connman_service *service)
 {
 	if (!service)
 		return NULL;
@@ -5595,7 +8784,7 @@ const char *__connman_service_get_phase2(struct connman_service *service)
 	return service->phase2;
 }
 
-bool __connman_service_wps_enabled(struct connman_service *service)
+bool __connman_service_wps_enabled(const struct connman_service *service)
 {
 	if (!service)
 		return false;
@@ -5635,9 +8824,9 @@ int __connman_service_set_favorite_delayed(struct connman_service *service,
 
 	if (!delay_ordering) {
 
-		service_list_sort();
+		SERVICE_LIST_SORT();
 
-		__connman_connection_update_gateway();
+		__connman_gateway_update();
 	}
 
 	return 0;
@@ -5657,12 +8846,12 @@ int __connman_service_set_favorite(struct connman_service *service,
 							false);
 }
 
-bool connman_service_get_favorite(struct connman_service *service)
+bool connman_service_get_favorite(const struct connman_service *service)
 {
 	return service->favorite;
 }
 
-bool connman_service_get_autoconnect(struct connman_service *service)
+bool connman_service_get_autoconnect(const struct connman_service *service)
 {
 	return service->autoconnect;
 }
@@ -5774,8 +8963,8 @@ static void report_error_cb(void *user_context, bool retry,
 		__connman_service_clear_error(service);
 
 		service_complete(service);
-		service_list_sort();
-		__connman_connection_update_gateway();
+		SERVICE_LIST_SORT();
+		__connman_gateway_update();
 	}
 }
 
@@ -5890,7 +9079,7 @@ static void request_input_cb(struct connman_service *service,
 
 	if (err >= 0) {
 		/* We forget any previous error. */
-		set_error(service, CONNMAN_SERVICE_ERROR_UNKNOWN);
+		clear_error(service);
 
 		__connman_service_connect(service,
 					CONNMAN_SERVICE_CONNECT_REASON_USER);
@@ -5915,14 +9104,29 @@ static void request_input_cb(struct connman_service *service,
 		}
 
 		service_complete(service);
-		__connman_connection_update_gateway();
+		__connman_gateway_update();
 	}
 }
 
+/**
+ *  @brief
+ *    Downgrade the service IPv4 and IPv6 states from "online" to
+ *    "ready" of all connected services.
+ *
+ *  This attempts to downgrade the IPv4 and IPv6 states of all
+ *  @a is_connected services to "ready" if they are "online".
+ *
+ *  @sa service_ipconfig_downgrade_online_state
+ *  @sa service_downgrade_online_state
+ *  @sa service_downgrade_online_state_if_default
+ *
+ */
 static void downgrade_connected_services(void)
 {
 	struct connman_service *up_service;
 	GList *list;
+
+	DBG("");
 
 	for (list = service_list; list; list = list->next) {
 		up_service = list->data;
@@ -5930,24 +9134,59 @@ static void downgrade_connected_services(void)
 		if (!is_connected(up_service->state))
 			continue;
 
-		if (up_service->state == CONNMAN_SERVICE_STATE_ONLINE)
+		if (is_online(up_service->state))
 			return;
 
-		downgrade_state(up_service);
+		service_downgrade_online_state(up_service);
 	}
 }
 
+/**
+ *  @brief
+ *    Potentially change the network service list order of the default
+ *    network service and the specified network service.
+ *
+ *  This attempts to switch the order of the specified services in the
+ *  network service list if and only if a) the services are non-null,
+ *  b) do not have pointer equivalence, and c) if @a new_service
+ *  should sort before @a default_service according to the @a
+ *  PreferredTechnologies list.
+ *
+ *  @param[in,out]  default_service  A pointer to the mutable, default
+ *                                   network service to potentially
+ *                                   demote in the network service
+ *                                   list to @b after @a new_service.
+ *  @param[in,out]  new_service      A pointer to the mutable service
+ *                                   to potentially promote in the
+ *                                   network service list to @b before
+ *                                   @a default_service.
+ *  @param[in]      new_state        The pending network service state
+ *                                   of @a new_service that is
+ *                                   precipitating the order update.
+ *
+ *  @retval  0          If the preferred order was successfully
+ *                      changed which includes @a default_service
+ *                      being null or @a default_service and @a
+ *                      new_service having pointer equivalence.
+ *  @retval  -EALREADY  If the preferred order was unchanged.
+ *
+ */
 static int service_update_preferred_order(struct connman_service *default_service,
 		struct connman_service *new_service,
 		enum connman_service_state new_state)
 {
+	DBG("default_service %p (%s) new_service %p (%s) new_state %d (%s)",
+		default_service, connman_service_get_identifier(default_service),
+		new_service, connman_service_get_identifier(new_service),
+		new_state, state2string(new_state));
+
 	if (!default_service || default_service == new_service)
 		return 0;
 
 	if (service_compare_preferred(default_service, new_service) > 0) {
-		switch_default_service(default_service,
+		switch_service_order(default_service,
 				new_service);
-		__connman_connection_update_gateway();
+		__connman_gateway_update();
 		return 0;
 	}
 
@@ -6005,8 +9244,9 @@ static int service_indicate_state(struct connman_service *service)
 	old_state = service->state;
 	new_state = combine_state(service->state_ipv4, service->state_ipv6);
 
-	DBG("service %p old %s - new %s/%s => %s",
+	DBG("service %p (%s) old %s - new %s/%s => %s",
 					service,
+					connman_service_get_identifier(service),
 					state2string(old_state),
 					state2string(service->state_ipv4),
 					state2string(service->state_ipv6),
@@ -6017,14 +9257,14 @@ static int service_indicate_state(struct connman_service *service)
 
 	def_service = connman_service_get_default();
 
-	if (new_state == CONNMAN_SERVICE_STATE_ONLINE) {
+	if (is_online(new_state)) {
 		result = service_update_preferred_order(def_service,
 				service, new_state);
 		if (result == -EALREADY)
 			return result;
 	}
 
-	if (old_state == CONNMAN_SERVICE_STATE_ONLINE)
+	if (is_online(old_state))
 		__connman_notifier_leave_online(service->type);
 
 	if (is_connected(old_state) && !is_connected(new_state))
@@ -6076,7 +9316,7 @@ static int service_indicate_state(struct connman_service *service)
 		break;
 
 	case CONNMAN_SERVICE_STATE_READY:
-		set_error(service, CONNMAN_SERVICE_ERROR_UNKNOWN);
+		clear_error(service);
 
 		if (service->new_service &&
 				__connman_stats_service_register(service) == 0) {
@@ -6097,7 +9337,7 @@ static int service_indicate_state(struct connman_service *service)
 
 		service_update_preferred_order(def_service, service, new_state);
 
-		default_changed();
+		DEFAULT_CHANGED();
 
 		__connman_service_set_favorite(service, true);
 
@@ -6123,7 +9363,7 @@ static int service_indicate_state(struct connman_service *service)
 		domain_changed(service);
 		proxy_changed(service);
 
-		if (old_state != CONNMAN_SERVICE_STATE_ONLINE)
+		if (!is_online(old_state))
 			__connman_notifier_connect(service->type);
 
 		method = __connman_ipconfig_get_method(service->ipconfig_ipv6);
@@ -6143,13 +9383,17 @@ static int service_indicate_state(struct connman_service *service)
 		break;
 
 	case CONNMAN_SERVICE_STATE_DISCONNECT:
-		set_error(service, CONNMAN_SERVICE_ERROR_UNKNOWN);
+		clear_error(service);
 
 		reply_pending(service, ECONNABORTED);
 
-		default_changed();
+		DEFAULT_CHANGED();
+
+		cancel_online_check(service, CONNMAN_IPCONFIG_TYPE_ALL);
 
 		__connman_wispr_stop(service);
+
+		online_check_state_reset(service);
 
 		__connman_wpad_stop(service);
 
@@ -6169,20 +9413,22 @@ static int service_indicate_state(struct connman_service *service)
 	case CONNMAN_SERVICE_STATE_FAILURE:
 		if (service->connect_reason == CONNMAN_SERVICE_CONNECT_REASON_USER ||
 			service->connect_reason == CONNMAN_SERVICE_CONNECT_REASON_NATIVE) {
-			connman_agent_report_error(service, service->path,
+			result = connman_agent_report_error(service,
+						service->path,
 						error2string(service->error),
 						report_error_cb,
 						get_dbus_sender(service),
 						NULL);
-			goto notifier;
+			if (result == -EINPROGRESS)
+				goto notifier;
 		}
 		service_complete(service);
 		break;
 	}
 
-	service_list_sort();
+	SERVICE_LIST_SORT();
 
-	__connman_connection_update_gateway();
+	__connman_gateway_update();
 
 notifier:
 	if ((old_state == CONNMAN_SERVICE_STATE_ONLINE &&
@@ -6192,9 +9438,9 @@ notifier:
 		__connman_notifier_disconnect(service->type);
 	}
 
-	if (new_state == CONNMAN_SERVICE_STATE_ONLINE) {
+	if (is_online(new_state)) {
 		__connman_notifier_enter_online(service->type);
-		default_changed();
+		DEFAULT_CHANGED();
 	}
 
 	return 0;
@@ -6224,7 +9470,7 @@ int __connman_service_indicate_error(struct connman_service *service,
 
 int __connman_service_clear_error(struct connman_service *service)
 {
-	DBusMessage *pending, *provider_pending;
+	DBusMessage *pending;
 
 	DBG("service %p", service);
 
@@ -6236,8 +9482,6 @@ int __connman_service_clear_error(struct connman_service *service)
 
 	pending = service->pending;
 	service->pending = NULL;
-	provider_pending = service->provider_pending;
-	service->provider_pending = NULL;
 
 	__connman_service_ipconfig_indicate_state(service,
 						CONNMAN_SERVICE_STATE_IDLE,
@@ -6248,14 +9492,15 @@ int __connman_service_clear_error(struct connman_service *service)
 						CONNMAN_IPCONFIG_TYPE_IPV4);
 
 	service->pending = pending;
-	service->provider_pending = provider_pending;
 
 	return 0;
 }
 
 int __connman_service_indicate_default(struct connman_service *service)
 {
-	DBG("service %p state %s", service, state2string(service->state));
+	DBG("service %p (%s) state %d (%s)",
+		service, connman_service_get_identifier(service),
+		service->state, state2string(service->state));
 
 	if (!is_connected(service->state)) {
 		/*
@@ -6266,7 +9511,7 @@ int __connman_service_indicate_default(struct connman_service *service)
 		return -EINPROGRESS;
 	}
 
-	default_changed();
+	DEFAULT_CHANGED();
 
 	return 0;
 }
@@ -6340,92 +9585,6 @@ static void service_rp_filter(struct connman_service *service,
 		connected_networks_count, original_rp_filter);
 }
 
-static void redo_wispr(struct connman_service *service,
-					enum connman_ipconfig_type type)
-{
-	DBG("Retrying %s WISPr for %p %s",
-		__connman_ipconfig_type2string(type),
-		service, service->name);
-
-	__connman_wispr_start(service, type);
-	connman_service_unref(service);
-}
-
-static gboolean redo_wispr_ipv4(gpointer user_data)
-{
-	struct connman_service *service = user_data;
-
-	service->online_timeout_ipv4 = 0;
-
-	redo_wispr(service, CONNMAN_IPCONFIG_TYPE_IPV4);
-
-	return FALSE;
-}
-
-static gboolean redo_wispr_ipv6(gpointer user_data)
-{
-	struct connman_service *service = user_data;
-
-	service->online_timeout_ipv6 = 0;
-
-	redo_wispr(service, CONNMAN_IPCONFIG_TYPE_IPV6);
-
-	return FALSE;
-}
-
-void __connman_service_online_check(struct connman_service *service,
-					enum connman_ipconfig_type type,
-					bool success)
-{
-	GSourceFunc redo_func;
-	unsigned int *interval;
-	enum connman_service_state current_state;
-	int timeout;
-
-	DBG("service %p type %s success %d\n",
-		service, __connman_ipconfig_type2string(type), success);
-
-	if (type == CONNMAN_IPCONFIG_TYPE_IPV4) {
-		interval = &service->online_check_interval_ipv4;
-		redo_func = redo_wispr_ipv4;
-	} else {
-		interval = &service->online_check_interval_ipv6;
-		redo_func = redo_wispr_ipv6;
-	}
-
-	if(!enable_online_to_ready_transition)
-		goto redo_func;
-
-	if (success) {
-		*interval = online_check_max_interval;
-	} else {
-		current_state = service->state;
-		downgrade_state(service);
-		if (current_state != service->state)
-			*interval = online_check_initial_interval;
-		if (service != connman_service_get_default()) {
-			return;
-		}
-	}
-
-redo_func:
-	DBG("service %p type %s interval %d", service,
-		__connman_ipconfig_type2string(type), *interval);
-
-	timeout = g_timeout_add_seconds(*interval * *interval,
-				redo_func, connman_service_ref(service));
-	if (type == CONNMAN_IPCONFIG_TYPE_IPV4)
-		service->online_timeout_ipv4 = timeout;
-	else
-		service->online_timeout_ipv6 = timeout;
-
-	/* Increment the interval for the next time, set a maximum timeout of
-	 * online_check_max_interval seconds * online_check_max_interval seconds.
-	 */
-	if (*interval < online_check_max_interval)
-		(*interval)++;
-}
-
 int __connman_service_ipconfig_indicate_state(struct connman_service *service,
 					enum connman_service_state new_state,
 					enum connman_ipconfig_type type)
@@ -6482,11 +9641,11 @@ int __connman_service_ipconfig_indicate_state(struct connman_service *service,
 	if (old_state == new_state)
 		return -EALREADY;
 
-	DBG("service %p (%s) old state %d (%s) new state %d (%s) type %d (%s)",
-		service, service ? service->identifier : NULL,
+	DBG("service %p (%s) type %d (%s) old state %d (%s) new state %d (%s)",
+		service, connman_service_get_identifier(service),
+		type, __connman_ipconfig_type2string(type),
 		old_state, state2string(old_state),
-		new_state, state2string(new_state),
-		type, __connman_ipconfig_type2string(type));
+		new_state, state2string(new_state));
 
 	switch (new_state) {
 	case CONNMAN_SERVICE_STATE_UNKNOWN:
@@ -6519,7 +9678,7 @@ int __connman_service_ipconfig_indicate_state(struct connman_service *service,
 
 	if (is_connected(old_state) && !is_connected(new_state)) {
 		nameserver_remove_all(service, type);
-		cancel_online_check(service);
+		cancel_online_check(service, type);
 	}
 
 	if (type == CONNMAN_IPCONFIG_TYPE_IPV4)
@@ -6527,11 +9686,29 @@ int __connman_service_ipconfig_indicate_state(struct connman_service *service,
 	else
 		service->state_ipv6 = new_state;
 
-	if (!is_connected(old_state) && is_connected(new_state))
+	if (!is_connected(old_state) && is_connected(new_state)) {
 		nameserver_add_all(service, type);
 
-	__connman_timeserver_sync(service,
+		/*
+		 * Care must be taken here in a multi-technology and -service
+		 * environment. In such an environment, there may be a senior,
+		 * default service that is providing the network service for
+		 * time-of-day synchronization.
+		 *
+		 * Without an appropriate qualifier here, a junior,
+		 * non-default service may come in and usurp the senior,
+		 * default service and start trying to provide time-of-day
+		 * synchronization which is NOT what is desired.
+		 *
+		 * However, this qualifier should NOT be moved to the next
+		 * most outer block. Otherwise, name servers will not be added
+		 * to junior, non-default services and they will be unusable
+		 * from a DNS perspective.
+		 */
+		if (connman_service_is_default(service))
+			__connman_timeserver_sync(service,
 				CONNMAN_TIMESERVER_SYNC_REASON_STATE_UPDATE);
+	}
 
 	return service_indicate_state(service);
 }
@@ -6951,9 +10128,9 @@ int __connman_service_provision_changed(const char *ident)
 	if (services_dirty) {
 		services_dirty = false;
 
-		service_list_sort();
+		SERVICE_LIST_SORT();
 
-		__connman_connection_update_gateway();
+		__connman_gateway_update();
 	}
 
 	return data.ret;
@@ -7024,9 +10201,9 @@ static int service_register(struct connman_service *service)
 	if (__connman_config_provision_service(service) < 0)
 		service_load(service);
 
-	service_list_sort();
+	SERVICE_LIST_SORT();
 
-	__connman_connection_update_gateway();
+	__connman_gateway_update();
 
 	return 0;
 }
@@ -7083,8 +10260,10 @@ static void service_ip_bound(struct connman_ipconfig *ipconfig,
 	type = __connman_ipconfig_get_config_type(ipconfig);
 	method = __connman_ipconfig_get_method(ipconfig);
 
-	DBG("service %p ipconfig %p type %d method %d", service, ipconfig,
-							type, method);
+	DBG("service %p (%s) type %d (%s) ipconfig %p method %d (%s)",
+		service, connman_service_get_identifier(service),
+		type, __connman_ipconfig_type2string(type),
+		ipconfig, method, __connman_ipconfig_method2string(method));
 
 	if (type == CONNMAN_IPCONFIG_TYPE_IPV6 &&
 			method == CONNMAN_IPCONFIG_METHOD_AUTO)
@@ -7126,12 +10305,34 @@ static void service_ip_release(struct connman_ipconfig *ipconfig,
 	settings_changed(service, ipconfig);
 }
 
+/**
+ *  @brief
+ *    Handler for IP configuration routes changes.
+ *
+ *  This is the IP configuration handler for route set (add) and unset
+ *  (delete) operations for the specified IP configuration and its
+ *  associated network interface name.
+ *
+ *  @param[in]  ipconfig  A pointer to the IP configuration associated
+ *                        with the network service route change.
+ *  @param[in]  ifname    A pointer to an immutable null-terminated
+ *                        C string containing the network interface
+ *                        name associated with the route change.
+ *
+ *  @sa __connman_ipconfig_set_data
+ *  @sa __connman_ipconfig_set_ops
+ *  @sa settings_changed
+ *
+ */
 static void service_route_changed(struct connman_ipconfig *ipconfig,
 				const char *ifname)
 {
 	struct connman_service *service = __connman_ipconfig_get_data(ipconfig);
 
-	DBG("%s route changed", ifname);
+	DBG("service %p (%s) ipconfig %p ifname %s route changed",
+		service, connman_service_get_identifier(service),
+		ipconfig,
+		ifname);
 
 	settings_changed(service, ipconfig);
 }
@@ -7294,22 +10495,22 @@ struct connman_service *__connman_service_lookup_from_index(int index)
 	return NULL;
 }
 
-const char *connman_service_get_identifier(struct connman_service *service)
+const char *connman_service_get_identifier(const struct connman_service *service)
 {
-	return service ? service->identifier : NULL;
+	return service ? service->identifier : "<null>";
 }
 
-const char *__connman_service_get_path(struct connman_service *service)
+const char *__connman_service_get_path(const struct connman_service *service)
 {
 	return service->path;
 }
 
-const char *__connman_service_get_name(struct connman_service *service)
+const char *__connman_service_get_name(const struct connman_service *service)
 {
 	return service->name;
 }
 
-enum connman_service_state connman_service_get_state(struct connman_service *service)
+enum connman_service_state connman_service_get_state(const struct connman_service *service)
 {
 	return service ? service->state : CONNMAN_SERVICE_STATE_UNKNOWN;
 }
@@ -7425,7 +10626,7 @@ static void update_from_network(struct connman_service *service,
 	if (!service->network)
 		service->network = connman_network_ref(network);
 
-	service_list_sort();
+	SERVICE_LIST_SORT();
 }
 
 static void trigger_autoconnect(struct connman_service *service)
@@ -7523,7 +10724,7 @@ struct connman_service * __connman_service_create_from_network(struct connman_ne
 			__connman_ipconfig_set_index(service->ipconfig_ipv6,
 									index);
 
-		__connman_connection_update_gateway();
+		__connman_gateway_update();
 		return service;
 	}
 
@@ -7632,7 +10833,7 @@ roaming:
 
 sorting:
 	if (need_sort) {
-		service_list_sort();
+		SERVICE_LIST_SORT();
 	}
 }
 
@@ -7649,7 +10850,7 @@ void __connman_service_remove_from_network(struct connman_network *network)
 
 	service->ignore = true;
 
-	__connman_connection_gateway_remove(service,
+	__connman_gateway_remove(service,
 					CONNMAN_IPCONFIG_TYPE_ALL);
 
 	connman_service_unref(service);
@@ -7841,6 +11042,21 @@ int __connman_service_init(void)
 	services_notify->add = g_hash_table_new(g_str_hash, g_str_equal);
 
 	remove_unprovisioned_services();
+
+	online_check_timeout_interval_style =
+		connman_setting_get_string("OnlineCheckIntervalStyle");
+	if (g_strcmp0(online_check_timeout_interval_style, "fibonacci") == 0)
+		online_check_timeout_compute_func = online_check_timeout_compute_fibonacci;
+	else
+		online_check_timeout_compute_func = online_check_timeout_compute_geometric;
+
+	online_check_connect_timeout_ms =
+		connman_setting_get_uint("OnlineCheckConnectTimeout");
+
+	online_check_initial_interval =
+		connman_setting_get_uint("OnlineCheckInitialInterval");
+	online_check_max_interval =
+		connman_setting_get_uint("OnlineCheckMaxInterval");
 
 	return 0;
 }

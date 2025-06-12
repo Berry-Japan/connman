@@ -40,6 +40,14 @@
 
 #include "connman.h"
 
+/* Linux reverse path filtering (rp_filter) validation setting values.
+ */
+enum {
+	__CONNMAN_LINUX_RP_FILTER_SETTING_NO_VALIDATION          = 0,
+	__CONNMAN_LINUX_RP_FILTER_SETTING_STRICT_MODE_VALIDATION = 1,
+	__CONNMAN_LINUX_RP_FILTER_SETTING_LOOSE_MODE_VALIDATION  = 2,
+};
+
 struct connman_ipconfig {
 	int refcount;
 	int index;
@@ -94,6 +102,11 @@ struct ipconfig_store {
 static GHashTable *ipdevice_hash = NULL;
 static GList *ipconfig_list = NULL;
 static bool is_ipv6_supported = false;
+
+static const char *maybe_null(const void *pointer)
+{
+	return pointer ? pointer : "<null>";
+}
 
 static void store_set_str(struct ipconfig_store *store,
 			const char *key, const char *val)
@@ -217,12 +230,13 @@ const char *__connman_ipconfig_type2string(enum connman_ipconfig_type type)
 {
 	switch (type) {
 	case CONNMAN_IPCONFIG_TYPE_UNKNOWN:
-	case CONNMAN_IPCONFIG_TYPE_ALL:
 		return "unknown";
 	case CONNMAN_IPCONFIG_TYPE_IPV4:
 		return "IPv4";
 	case CONNMAN_IPCONFIG_TYPE_IPV6:
 		return "IPv6";
+	case CONNMAN_IPCONFIG_TYPE_ALL:
+		return "IPv4 + IPv6";
 	}
 
 	return NULL;
@@ -249,9 +263,9 @@ static const char *type2str(unsigned short type)
 static const char *scope2str(unsigned char scope)
 {
 	switch (scope) {
-	case 0:
+	case RT_SCOPE_UNIVERSE:
 		return "UNIVERSE";
-	case 253:
+	case RT_SCOPE_LINK:
 		return "LINK";
 	}
 
@@ -261,6 +275,45 @@ static const char *scope2str(unsigned char scope)
 #define PROC_IPV4_CONF_PREFIX "/proc/sys/net/ipv4/conf"
 #define PROC_IPV6_CONF_PREFIX "/proc/sys/net/ipv6/conf"
 
+/**
+ *  @brief
+ *    Get the file system configuration value associated with the
+ *    composed prefix, optional network interface name, and suffix
+ *    path components.
+ *
+ *  This attempts to read and return the file system (ostensibly from
+ *  the Linux proc file system) configuration value associated with
+ *  the composed combination of the specified prefix, optional network
+ *  interface name, and suffix path components. If the network
+ *  interface name is null, then "all" is used. The composed path name
+ *  will look like "prefix/<ifname|all>/suffix".
+ *
+ *  @param[in]   prefix  A pointer to the immutable null-terminated C
+ *                       string containing the prefix component(s) of
+ *                       the file system path for which to get the
+ *                       configuration value.
+ *  @param[in]   ifname  An optional pointer to the immutable null-
+ *                       terminated C string containing the network
+ *                       interface name to use as the path component
+ *                       between @a prefix and @a suffix. If null,
+ *                       "all" will be used.
+ *  @param[in]   suffix  A pointer to the immutable null-terminated C
+ *                       string containing the suffix component(s) of
+ *                       the file system path for which to get the
+ *                       configuration value.
+ *  @param[out]  value   A pointer to storage to be populated with the
+ *                       read configuration value, if successful.
+ *
+ *  @retval  1         If successful.
+ *  @retval  0         If no configuration value was successfully read.
+ *  @retval  -ENOMEM   If memory could not be allocated for the
+ *                     configuration path name to be read.
+ *  @retval  -ENOENT   The composed configuration path name does not
+ *                     exist.
+ *  @retval  -EACCESS  The current process does not have permission
+ *                     to access the composed configuration path name.
+ *
+ */
 static int read_conf_value(const char *prefix, const char *ifname,
 					const char *suffix, int *value)
 {
@@ -268,11 +321,14 @@ static int read_conf_value(const char *prefix, const char *ifname,
 	FILE *f;
 	int err;
 
+	// Build the file system path name from the specified,
+	// null-terminated variable argument component list.
+
 	path = g_build_filename(prefix, ifname ? ifname : "all", suffix, NULL);
 	if (!path)
 		return -ENOMEM;
 
-	errno = 0;
+	errno = 0; /* Avoid stale errno values with fopen */
 	f = fopen(path, "r");
 	if (!f) {
 		err = -errno;
@@ -294,12 +350,84 @@ static int read_conf_value(const char *prefix, const char *ifname,
 	return err;
 }
 
+/**
+ *  @brief
+ *    Get the Linux proc file system configuration value associated
+ *    with the composed /proc/sys/net/ipv4/conf prefix, optional
+ *    network interface name, and suffix path components.
+ *
+ *  This attempts to read and return the file system (ostensibly from
+ *  the Linux proc file system) configuration value associated with
+ *  the composed combination of the /proc/sys/net/ipv4/conf prefix,
+ *  optional network interface name, and suffix path components. If
+ *  the network interface name is null, then "all" is used. The
+ *  composed path name will look like "/proc/sys/net/ipv4/conf/
+ *  <ifname|all>/suffix".
+ *
+ *  @param[in]   ifname  An optional pointer to the immutable null-
+ *                       terminated C string containing the network
+ *                       interface name to use as the path component
+ *                       between @a prefix and @a suffix. If null,
+ *                       "all" will be used.
+ *  @param[in]   suffix  A pointer to the immutable null-terminated C
+ *                       string containing the suffix component(s) of
+ *                       the file system path for which to get the
+ *                       configuration value.
+ *  @param[out]  value   A pointer to storage to be populated with the
+ *                       read configuration value, if successful.
+ *
+ *  @retval  1         If successful.
+ *  @retval  0         If no configuration value was successfully read.
+ *  @retval  -ENOMEM   If memory could not be allocated for the
+ *                     configuration path name to be read.
+ *  @retval  -ENOENT   The composed configuration path name does not
+ *                     exist.
+ *  @retval  -EACCESS  The current process does not have permission
+ *                     to access the composed configuration path name.
+ *
+ */
 static int read_ipv4_conf_value(const char *ifname, const char *suffix,
 								int *value)
 {
 	return read_conf_value(PROC_IPV4_CONF_PREFIX, ifname, suffix, value);
 }
 
+/**
+ *  @brief
+ *    Get the Linux proc file system configuration value associated
+ *    with the composed /proc/sys/net/ipv6/conf prefix, optional
+ *    network interface name, and suffix path components.
+ *
+ *  This attempts to read and return the file system (ostensibly from
+ *  the Linux proc file system) configuration value associated with
+ *  the composed combination of the /proc/sys/net/ipv6/conf prefix,
+ *  optional network interface name, and suffix path components. If
+ *  the network interface name is null, then "all" is used. The
+ *  composed path name will look like "/proc/sys/net/ipv6/conf/
+ *  <ifname|all>/suffix".
+ *
+ *  @param[in]   ifname  An optional pointer to the immutable null-
+ *                       terminated C string containing the network
+ *                       interface name to use as the path component
+ *                       between @a prefix and @a suffix. If null,
+ *                       "all" will be used.
+ *  @param[in]   suffix  A pointer to the immutable null-terminated C
+ *                       string containing the suffix component(s) of
+ *                       the file system path for which to get the
+ *                       configuration value.
+ *  @param[out]  value   A pointer to storage to be populated with the
+ *                       read configuration value, if successful.
+ *
+ *  @retval  1         If successful.
+ *  @retval  0         If no configuration value was successfully read.
+ *  @retval  -ENOMEM   If memory could not be allocated for the
+ *                     configuration path name to be read.
+ *  @retval  -ENOENT   The composed configuration path name does not
+ *                     exist.
+ *  @retval  -EACCESS  The current process does not have permission
+ *                     to access the composed configuration path name.
+ *
+ */
 static int read_ipv6_conf_value(const char *ifname, const char *suffix,
 								int *value)
 {
@@ -344,9 +472,9 @@ static int write_ipv6_conf_value(const char *ifname, const char *suffix,
 	return write_conf_value(PROC_IPV6_CONF_PREFIX, ifname, suffix, value);
 }
 
-static bool get_ipv6_state(gchar *ifname)
+static bool get_ipv6_state(const gchar *ifname)
 {
-	int disabled;
+	int disabled = 1;
 	bool enabled = false;
 
 	if (read_ipv6_conf_value(ifname, "disable_ipv6", &disabled) > 0)
@@ -355,7 +483,7 @@ static bool get_ipv6_state(gchar *ifname)
 	return enabled;
 }
 
-static int set_ipv6_state(gchar *ifname, bool enable)
+static int set_ipv6_state(const gchar *ifname, bool enable)
 {
 	int disabled = enable ? 0 : 1;
 
@@ -364,15 +492,32 @@ static int set_ipv6_state(gchar *ifname, bool enable)
 	return write_ipv6_conf_value(ifname, "disable_ipv6", disabled);
 }
 
-static int get_ipv6_privacy(gchar *ifname)
+/**
+ *  @brief
+ *    Return the IPv6 address privacy setting from the Linux kernel
+ *    proc file system for the specified network interface name.
+ *
+ *  This attempts to read and return the IPv6 address privacy setting
+ *  (that is, "use_tempaddr") from the Linux kernel proc file system
+ *  for the specified network interface name.
+ *
+ *  @param[in]  ifname  A pointer to the immutable null-terminated C
+ *                      string of the network interface name for which
+ *                      to return the IPv6 privacy setting.
+ *
+ *  @retval  <= 0  IPv6 address privacy is disabled.
+ *  @retval     1  IPv6 address privacy is enabled.
+ *  @retval     2  IPv6 address privacy is preferred.
+ *
+ */
+static int get_ipv6_privacy(const gchar *ifname)
 {
-	int value;
+	int value = 0;
 
 	if (!ifname)
-		return 0;
+		return value;
 
-	if (read_ipv6_conf_value(ifname, "use_tempaddr", &value) < 0)
-		value = 0;
+	read_ipv6_conf_value(ifname, "use_tempaddr", &value);
 
 	return value;
 }
@@ -380,7 +525,7 @@ static int get_ipv6_privacy(gchar *ifname)
 /* Enable the IPv6 privacy extension for stateless address autoconfiguration.
  * The privacy extension is described in RFC 3041 and RFC 4941
  */
-static int set_ipv6_privacy(gchar *ifname, int value)
+static int set_ipv6_privacy(const gchar *ifname, int value)
 {
 	if (!ifname)
 		return -EINVAL;
@@ -391,12 +536,27 @@ static int set_ipv6_privacy(gchar *ifname, int value)
 	return write_ipv6_conf_value(ifname, "use_tempaddr", value);
 }
 
+/**
+ *  @brief
+ *    Return the IPv4 reverse path routing validation setting from the
+ *    Linux kernel proc file system.
+ *
+ *  This attempts to read and return the IPv6 address privacy setting
+ *  (that is, "rp_filter") from the Linux kernel proc file system.
+ *
+ *  @retval  -EINVAL  The setting could not be read.
+ *  @retval  0        No reverse path routing validation is in effect.
+ *  @retval  1        Strict mode reverse path routing validation is
+ *                    in effect.
+ *  @retval  2        Loose mode reverse path routing validation is
+ *                    in effect.
+ *
+ */
 static int get_rp_filter(void)
 {
-	int value;
+	int value = -EINVAL;
 
-	if (read_ipv4_conf_value(NULL, "rp_filter", &value) < 0)
-		value = -EINVAL;
+	read_ipv4_conf_value(NULL, "rp_filter", &value);
 
 	return value;
 }
@@ -406,11 +566,11 @@ static int set_rp_filter(int value)
 	/* 0 = no validation, 1 = strict mode, 2 = loose mode */
 	switch (value) {
 	case -1:
-		value = 0;
+		value = __CONNMAN_LINUX_RP_FILTER_SETTING_NO_VALIDATION;
 		/* fall through */
-	case 0:
-	case 1:
-	case 2:
+	case __CONNMAN_LINUX_RP_FILTER_SETTING_NO_VALIDATION:
+	case __CONNMAN_LINUX_RP_FILTER_SETTING_STRICT_MODE_VALIDATION:
+	case __CONNMAN_LINUX_RP_FILTER_SETTING_LOOSE_MODE_VALIDATION:
 		break;
 	default:
 		return -EINVAL;
@@ -421,6 +581,7 @@ static int set_rp_filter(int value)
 
 int __connman_ipconfig_set_rp_filter()
 {
+	const int default_value = __CONNMAN_LINUX_RP_FILTER_SETTING_LOOSE_MODE_VALIDATION;
 	int value;
 
 	value = get_rp_filter();
@@ -428,10 +589,10 @@ int __connman_ipconfig_set_rp_filter()
 	if (value < 0)
 		return value;
 
-	set_rp_filter(2);
+	set_rp_filter(default_value);
 
-	connman_info("rp_filter set to 2 (loose mode routing), "
-			"old value was %d", value);
+	connman_info("rp_filter set to %d (loose mode routing), "
+			"old value was %d", default_value, value);
 
 	return value;
 }
@@ -877,7 +1038,10 @@ out:
 }
 
 void __connman_ipconfig_newroute(int index, int family, unsigned char scope,
-					const char *dst, const char *gateway)
+					const char *dst,
+					unsigned char dst_prefixlen,
+					const char *gateway,
+					uint32_t table_id, uint32_t metric)
 {
 	struct connman_ipdevice *ipdevice;
 	char *ifname;
@@ -938,15 +1102,20 @@ void __connman_ipconfig_newroute(int index, int family, unsigned char scope,
 		}
 	}
 
-	connman_info("%s {add} route %s gw %s scope %u <%s>",
-		ifname, dst, gateway, scope, scope2str(scope));
+	DBG("%s {add} route %s/%u gw %s scope %u <%s> table %u <%s> "
+		"metric %u",
+		ifname, dst, dst_prefixlen, gateway, scope, scope2str(scope),
+		table_id, __connman_inet_table2string(table_id), metric);
 
 out:
 	g_free(ifname);
 }
 
 void __connman_ipconfig_delroute(int index, int family, unsigned char scope,
-					const char *dst, const char *gateway)
+					const char *dst,
+					unsigned char dst_prefixlen,
+					const char *gateway,
+					uint32_t table_id, uint32_t metric)
 {
 	struct connman_ipdevice *ipdevice;
 	char *ifname;
@@ -1005,8 +1174,10 @@ void __connman_ipconfig_delroute(int index, int family, unsigned char scope,
 		}
 	}
 
-	connman_info("%s {del} route %s gw %s scope %u <%s>",
-		ifname, dst, gateway, scope, scope2str(scope));
+	DBG("%s {del} route %s/%u gw %s scope %u <%s> table %u <%s> "
+		"metric %u",
+		ifname, dst, dst_prefixlen, gateway, scope, scope2str(scope),
+		table_id, __connman_inet_table2string(table_id), metric);
 
 out:
 	g_free(ifname);
@@ -1147,7 +1318,7 @@ void __connman_ipconfig_set_broadcast(struct connman_ipconfig *ipconfig,
 	ipconfig->address->broadcast = g_strdup(broadcast);
 }
 
-const char *__connman_ipconfig_get_gateway(struct connman_ipconfig *ipconfig)
+const char *__connman_ipconfig_get_gateway(const struct connman_ipconfig *ipconfig)
 {
 	if (!ipconfig->address)
 		return NULL;
@@ -1166,11 +1337,41 @@ void __connman_ipconfig_set_gateway(struct connman_ipconfig *ipconfig,
 	ipconfig->address->gateway = g_strdup(gateway);
 }
 
-int __connman_ipconfig_gateway_add(struct connman_ipconfig *ipconfig)
+/**
+ *  @brief
+ *    Add, or set, the gateway, or default router, for a network
+ *    service.
+ *
+ *  This attempts to add, or set, the gateway, or default router, for
+ *  a network service using the specified IP configuration.
+ *
+ *  @param[in]  ipconfig  A pointer to the immutable IP configuration
+ *                        containing the network interface index @a
+ *                        index as the lookup key for the network
+ *                        service for which to add, or set, the
+ *                        gateway.
+ *
+ *  @retval  0        If successful.
+ *  @retval  -EINVAL  If the @a address field of @a ipconfig is null,
+ *                    if a cooresponding service cannot be found for
+ *                    the network interface index @a index of @a
+ *                    ipconfig, or if the network interface index
+ *                    associated with @a service is invalid.
+ *
+ *  @sa __connman_ipconfig_gateway_remove
+ *  @sa __connman_gateway_add
+ *
+ */
+int __connman_ipconfig_gateway_add(const struct connman_ipconfig *ipconfig)
 {
 	struct connman_service *service;
+	g_autofree char *interface = NULL;
 
-	DBG("");
+	interface = connman_inet_ifname(ipconfig->index);
+
+	DBG("ipconfig %p type %d (%s) index %d (%s)", ipconfig,
+		ipconfig->type, __connman_ipconfig_type2string(ipconfig->type),
+		ipconfig->index, maybe_null(interface));
 
 	if (!ipconfig->address)
 		return -EINVAL;
@@ -1179,12 +1380,12 @@ int __connman_ipconfig_gateway_add(struct connman_ipconfig *ipconfig)
 	if (!service)
 		return -EINVAL;
 
-	DBG("type %d gw %s peer %s", ipconfig->type,
+	DBG("gw %s peer %s",
 		ipconfig->address->gateway, ipconfig->address->peer);
 
 	if (ipconfig->type == CONNMAN_IPCONFIG_TYPE_IPV6 ||
 				ipconfig->type == CONNMAN_IPCONFIG_TYPE_IPV4)
-		return __connman_connection_gateway_add(service,
+		return __connman_gateway_add(service,
 						ipconfig->address->gateway,
 						ipconfig->type,
 						ipconfig->address->peer);
@@ -1192,15 +1393,38 @@ int __connman_ipconfig_gateway_add(struct connman_ipconfig *ipconfig)
 	return 0;
 }
 
-void __connman_ipconfig_gateway_remove(struct connman_ipconfig *ipconfig)
+/**
+ *  @brief
+ *    Remove, or clear, the gateway, or default router, for a network
+ *    service.
+ *
+ *  This attempts to remove, or clear, the gateway, or default router, for
+ *  a network service using the specified IP configuration.
+ *
+ *  @param[in]  ipconfig  A pointer to the immutable IP configuration
+ *                        containing the network interface index @a
+ *                        index as the lookup key for the network
+ *                        service for which to remove, or clear, the
+ *                        gateway.
+ *
+ *  @sa __connman_ipconfig_gateway_add
+ *  @sa __connman_gateway_remove
+ *
+ */
+void __connman_ipconfig_gateway_remove(const struct connman_ipconfig *ipconfig)
 {
 	struct connman_service *service;
+	g_autofree char *interface = NULL;
 
-	DBG("");
+	interface = connman_inet_ifname(ipconfig->index);
+
+	DBG("ipconfig %p type %d (%s) index %d (%s)", ipconfig,
+		ipconfig->type, __connman_ipconfig_type2string(ipconfig->type),
+		ipconfig->index, maybe_null(interface));
 
 	service = __connman_service_lookup_from_index(ipconfig->index);
 	if (service)
-		__connman_connection_gateway_remove(service, ipconfig->type);
+		__connman_gateway_remove(service, ipconfig->type);
 }
 
 unsigned char __connman_ipconfig_get_prefixlen(struct connman_ipconfig *ipconfig)
@@ -1388,7 +1612,7 @@ void __connman_ipconfig_set_data(struct connman_ipconfig *ipconfig, void *data)
  *
  * Get interface index
  */
-int __connman_ipconfig_get_index(struct connman_ipconfig *ipconfig)
+int __connman_ipconfig_get_index(const struct connman_ipconfig *ipconfig)
 {
 	if (!ipconfig)
 		return -1;

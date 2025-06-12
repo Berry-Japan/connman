@@ -1,5 +1,5 @@
 %define name connman
-%define version 1.42
+%define version 1.44
 %define release b1
 %define _libdir /usr/lib
 
@@ -9,31 +9,31 @@ Release:	%{release}
 Summary:	Connection Manager
 License:	GPLv2
 Group:		System Environment/Networking
-URL:		https://www.moblin.org/
-Source0:	https://www.kernel.org/pub/linux/network/connman/connman-%{version}.tar.bz2
+URL:		https://01.org/connman
+Source0:	https://www.kernel.org/pub/linux/network/connman/%{name}-%{version}.tar.xz
 Buildroot:	%{_tmppath}/%{name}-%{version}
 
 Requires:	iwd
 BuildRequires:	dbus-devel, iptables-devel
-#BuildRequires:	iptables-devel
 BuildRequires:	libmnl-devel
 BuildRequires:	readline-devel
 BuildRequires:	kernel-headers
-
 
 %description
 Connection Manager provides a daemon for managing Internet connections
 within embedded devices running the Linux operating system.
 
 
-##
-## Setup Section
-##
-
 %prep
 %setup -q
 #./configure --prefix=/usr --disable-debug --enable-iwd --disable-wispr --enable-nmcompat --enable-polkit
-%configure	--disable-debug \
+#export CFLAGS="-fPIE"
+#export LDFLAGS="-pie"
+#define _hardened_build 0
+#sudo sysctl -w kernel.randomize_va_space=0
+#configure	--disable-debug \
+./configure	--prefix=/usr \
+                --disable-debug \
 		--enable-iwd \
 		--disable-wispr \
 		--enable-nmcompat \
@@ -52,27 +52,13 @@ within embedded devices running the Linux operating system.
 		--enable-google \
 		 CFLAGS=-Os
 
-
-##
-## Build Section
-##
-
 %build
 %make_build
-
-
-##
-## Install Section
-##
 
 %install
 %make_install
 strip $RPM_BUILD_ROOT/usr/sbin/connmand
 
-
-##
-## Clean Section
-##
 
 %clean
 [ -n "%{buildroot}" -a "%{buildroot}" != / ] && rm -rf %{buildroot}
@@ -103,10 +89,6 @@ rm -rf $RPM_BUILD_DIR/%{name}-%{version}
 #service_del_postun connman-wait-online.service
 
 
-##
-## Files Section
-##
-
 %files
 #%defattr (-,root,root)
 %{_bindir}/connmanctl
@@ -134,10 +116,8 @@ rm -rf $RPM_BUILD_DIR/%{name}-%{version}
 %{_datadir}/polkit-1/actions/net.connman.vpn.policy
 
 
-##
-## change log
-##
-
 %changelog
+* Wed Jun 11 2025 Yuichiro Nakada <berry@berry-lab.net>
+- Update to 1.44
 * Thu Nov 23 2023 Yuichiro Nakada <berry@berry-lab.net>
 - Create for Berry Linux

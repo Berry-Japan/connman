@@ -1,0 +1,5 @@
+--- connman-1.36/scripts/connman_resolvconf.conf.in.orig	2018-09-12 22:54:44.243137751 +0300
++++ connman-1.36/scripts/connman_resolvconf.conf.in	2018-09-12 22:54:49.889090253 +0300
+@@ -1,2 +1 @@
+ d	@runstatedir@/connman	- - - -
+-L	/etc/resolv.conf	- - - -	@runstatedir@/connman/resolv.conf

@@ -383,7 +383,7 @@ static void dummy_resolve_func(GResolvResultStatus status,
  * Refresh a DNS entry, but also age the hit count a bit */
 static void refresh_dns_entry(struct cache_entry *entry, char *name)
 {
-	int age = 1;
+	unsigned int age = 1;
 
 	if (!ipv4_resolve) {
 		ipv4_resolve = g_resolv_new(0);
@@ -424,23 +424,23 @@ static size_t dns_name_length(const unsigned char *buf)
 	return strlen((const char *)buf) + 1;
 }
 
-static void update_cached_ttl(unsigned char *ptr, int len, int new_ttl)
+static void update_cached_ttl(unsigned char *ptr, size_t len, int new_ttl)
 {
 	size_t name_len;
 	const uint32_t raw_ttl = ntohl((uint32_t)new_ttl);
 
-	if (new_ttl < 0)
+	if (new_ttl < 0 || len < DNS_HEADER_SIZE + DNS_QUESTION_SIZE + 1)
 		return;
 
 	/* skip the header */
 	ptr += DNS_HEADER_SIZE;
 	len -= DNS_HEADER_SIZE;
 
-	if (len < DNS_QUESTION_SIZE + 1)
-		return;
-
 	/* skip the query, which is a name and a struct domain_question */
 	name_len = dns_name_length(ptr);
+
+	if (len < name_len + DNS_QUESTION_SIZE)
+		return;
 
 	ptr += name_len + DNS_QUESTION_SIZE;
 	len -= name_len + DNS_QUESTION_SIZE;
@@ -453,10 +453,11 @@ static void update_cached_ttl(unsigned char *ptr, int len, int new_ttl)
 
 		/* first a name */
 		name_len = dns_name_length(ptr);
+		if (len < name_len)
+			break;
+
 		ptr += name_len;
 		len -= name_len;
-		if (len < 0)
-			break;
 
 		rr = (void*)ptr;
 		if (len < sizeof(*rr))
@@ -468,6 +469,9 @@ static void update_cached_ttl(unsigned char *ptr, int len, int new_ttl)
 
 		/* skip to the next record */
 		rr_len = sizeof(*rr) + ntohs(rr->rdlen);
+		if (len < rr_len)
+			break;
+
 		ptr += rr_len;
 		len -= rr_len;
 	}
@@ -479,15 +483,18 @@ static void send_cached_response(int sk, const unsigned char *ptr, size_t len,
 {
 	struct domain_hdr *hdr = NULL;
 	int err;
+	size_t bytes_sent;
 	const size_t offset = protocol_offset(protocol);
 	/*
 	 * The cached packet contains always the TCP offset (two bytes)
 	 * so skip them for UDP.
 	 */
 	const size_t skip_bytes = offset ? 0 : DNS_HEADER_TCP_EXTRA_BYTES;
+	size_t dns_len;
+
 	ptr += skip_bytes;
 	len -= skip_bytes;
-	const size_t dns_len = protocol == IPPROTO_UDP ? len : ntohs(*((uint16_t*)ptr));
+	dns_len = protocol == IPPROTO_UDP ? len : ntohs(*((uint16_t*)ptr));
 
 
 	if (len < DNS_HEADER_SIZE)
@@ -505,10 +512,8 @@ static void send_cached_response(int sk, const unsigned char *ptr, size_t len,
 	/* if this is a negative reply, we are authoritative */
 	if (answers == 0)
 		hdr->aa = 1;
-	else {
-		const int adj_len = len - 2;
-		update_cached_ttl((unsigned char *)hdr, adj_len, ttl);
-	}
+	else
+		update_cached_ttl((unsigned char *)hdr, dns_len, ttl);
 
 	debug("sk %d id 0x%04x answers %d ptr %p length %zd dns %zd",
 		sk, hdr->id, answers, ptr, len, dns_len);
@@ -518,7 +523,9 @@ static void send_cached_response(int sk, const unsigned char *ptr, size_t len,
 		connman_error("Cannot send cached DNS response: %s",
 				strerror(errno));
 	}
-	else if (err != len || dns_len != (len - offset))
+
+	bytes_sent = err;
+	if (bytes_sent != len || dns_len != (len - offset))
 		debug("Packet length mismatch, sent %d wanted %zd dns %zd",
 			err, len, dns_len);
 }
@@ -616,9 +623,10 @@ static gboolean request_timeout(gpointer user_data)
 		 * "not found" result), so send that back to client instead
 		 * of more fatal server failed error.
 		 */
-		sendto(sk, req->resp, req->resplen, MSG_NOSIGNAL,
-			sa, req->sa_len);
-
+		if (sendto(sk, req->resp, req->resplen, MSG_NOSIGNAL,
+				sa, req->sa_len) < 0)
+			connman_error("Failed to send response %d: %s",
+					sk, strerror(errno));
 	} else if (req->request) {
 		/*
 		 * There was not reply from server at all.
@@ -653,8 +661,8 @@ static int append_data(unsigned char *buf, size_t size, const char *data)
 	size_t len;
 
 	while (true) {
-		const char *dot = strchr(data, '.');
-		len = dot ? dot - data : strlen(data);
+		const char *dot = strchrnul(data, '.');
+		len = dot - data;
 
 		if (len == 0)
 			break;
@@ -847,14 +855,19 @@ static void create_cache(void)
 
 static struct cache_entry *cache_check(gpointer request, uint16_t *qtype, int proto)
 {
+	const char *question;
+	size_t offset;
+	const struct domain_question *q;
+	uint16_t type;
+	struct cache_entry *entry;
+
 	if (!request)
 		return NULL;
 
-	const char *question = request + protocol_offset(proto) + DNS_HEADER_SIZE;
-	const size_t offset = strlen(question) + 1;
-	const struct domain_question *q = (void *) (question + offset);
-	const uint16_t type = ntohs(q->type);
-	struct cache_entry *entry;
+	question = request + protocol_offset(proto) + DNS_HEADER_SIZE;
+	offset = strlen(question) + 1;
+	q = (void *) (question + offset);
+	type = ntohs(q->type);
 
 	/* We only cache either A (1) or AAAA (28) requests */
 	if (type != DNS_TYPE_A && type != DNS_TYPE_AAAA)
@@ -1028,6 +1041,9 @@ static int parse_response(const unsigned char *buf, size_t buflen,
 	uint16_t ancount, qclass;
 	GSList *aliases = NULL;
 	const size_t maxlen = *response_len;
+	uint16_t qdcount;
+	const unsigned char *ptr;
+	const unsigned char *eptr;
 
 	*response_len = 0;
 	*answers = 0;
@@ -1035,9 +1051,9 @@ static int parse_response(const unsigned char *buf, size_t buflen,
 	if (buflen < DNS_HEADER_SIZE)
 		return -EINVAL;
 
-	const uint16_t qdcount = ntohs(hdr->qdcount);
-	const unsigned char *ptr = buf + DNS_HEADER_SIZE;
-	const unsigned char *eptr = buf + buflen;
+	qdcount = ntohs(hdr->qdcount);
+	ptr = buf + DNS_HEADER_SIZE;
+	eptr = buf + buflen;
 
 	debug("qr %d qdcount %d", hdr->qr, qdcount);
 
@@ -1053,7 +1069,7 @@ static int parse_response(const unsigned char *buf, size_t buflen,
 	qlen = strlen(question);
 	ptr += qlen + 1; /* skip \0 */
 
-	if ((eptr - ptr) < DNS_QUESTION_SIZE)
+	if (ptr + DNS_QUESTION_SIZE >= eptr)
 		return -EINVAL;
 
 	q = (void *) ptr;
@@ -1861,7 +1877,7 @@ static const char* uncompress(int16_t field_count, const char *start, const char
 		} else if (dns_type == DNS_TYPE_A || dns_type == DNS_TYPE_AAAA) {
 			dlen = uptr[-2] << 8 | uptr[-1];
 
-			if ((ptr + dlen) > end || (uptr + dlen) > uncomp_end) {
+			if (dlen > (end - ptr) || dlen > (uncomp_end - uptr)) {
 				debug("data len %d too long", dlen);
 				return NULL;
 			}
@@ -2010,40 +2026,47 @@ static int dns_reply_fixup_domains(
 	int new_an_len;
 	const struct domain_hdr *hdr = (void *)(reply + offset);
 	const char *eom = reply + reply_len;
-	const uint16_t header_len = offset + DNS_HEADER_SIZE;
+	uint16_t header_len = offset + DNS_HEADER_SIZE;
+	uint16_t domain_len;
+	struct qtype_qclass *qtc;
+	uint16_t dns_type;
+	uint16_t dns_class;
+	uint16_t section_counts[3];
+	const char *ptr;
+	uint8_t host_len;
+	const char *domain;
+
 	/* full header plus at least one byte for the hostname length */
-	if (reply_len < header_len + 1)
+	if (reply_len < header_len + 1U)
 		return -EINVAL;
 
-	const uint16_t section_counts[] = {
-		hdr->ancount,
-		hdr->nscount,
-		hdr->arcount
-	};
+	section_counts[0] = hdr->ancount;
+	section_counts[1] = hdr->nscount;
+	section_counts[2] = hdr->arcount;
 
 	/*
 	 * length octet of the hostname.
 	 * ->hostname.domain.net
 	 */
-	const char *ptr = reply + header_len;
-	const uint8_t host_len = *ptr;
-	const char *domain = ptr + host_len + 1;
+	ptr = reply + header_len;
+	host_len = *ptr;
+	domain = ptr + host_len + 1;
 	if (domain >= eom)
 		return -EINVAL;
 
-	const uint16_t domain_len = host_len ? strnlen(domain, eom - domain) : 0;
+	domain_len = host_len ? strnlen(domain, eom - domain) : 0;
 
 	/*
 	 * If the query type is anything other than A or AAAA, then bail out
 	 * and pass the message as is.  We only want to deal with IPv4 or IPv6
 	 * addresses.
 	 */
-	const struct qtype_qclass *qtc = (void*)(domain + domain_len + 1);
+	qtc = (void*)(domain + domain_len + 1);
 	if (((const char*)(qtc + 1)) > eom)
 		return -EINVAL;
 
-	const uint16_t dns_type = ntohs(qtc->qtype);
-	const uint16_t dns_class = ntohs(qtc->qclass);
+	dns_type = ntohs(qtc->qtype);
+	dns_class = ntohs(qtc->qclass);
 
 	if (domain_len == 0) {
 		/* nothing to do */
@@ -2493,6 +2516,7 @@ hangup:
 
 		if (!reply) {
 			uint16_t reply_len;
+			size_t bytes_len;
 
 			bytes_recv = recv(sk, &reply_len, sizeof(reply_len), MSG_PEEK);
 			if (!bytes_recv) {
@@ -2504,7 +2528,10 @@ hangup:
 				connman_error("DNS proxy error %s",
 						strerror(errno));
 				goto hangup;
-			} else if (bytes_recv < sizeof(reply_len))
+			}
+
+			bytes_len = bytes_recv;
+			if (bytes_len < sizeof(reply_len))
 				return TRUE;
 
 			/* the header contains the length of the message
@@ -3003,7 +3030,7 @@ static void dnsproxy_default_changed(struct connman_service *service)
 	 * the VPN must be enabled as well, when the transport becomes the
 	 * default service.
 	 */
-	vpn_index = __connman_connection_get_vpn_index(index);
+	vpn_index = __connman_gateway_get_vpn_index(index);
 
 	for (GSList *list = server_list; list; list = list->next) {
 		struct server_data *data = list->data;
@@ -3288,9 +3315,12 @@ read_another:
 	 */
 	entry = cache_check(client->buf, &qtype, IPPROTO_TCP);
 	if (entry) {
-		debug("cache hit %s type %s", query, qtype == DNS_TYPE_A ? "A" : "AAAA");
-		struct cache_data *data = qtype == DNS_TYPE_A ?
-			entry->ipv4 : entry->ipv6;
+		struct cache_data *data;
+
+		debug("cache hit %s type %s", query,
+					qtype == DNS_TYPE_A ? "A" : "AAAA");
+
+		data = qtype == DNS_TYPE_A ? entry->ipv4 : entry->ipv6;
 
 		if (data) {
 			int ttl_left = data->valid_until - time(NULL);
@@ -3401,6 +3431,13 @@ static gboolean tcp_client_event(GIOChannel *channel, GIOCondition condition,
 {
 	struct tcp_partial_client_data *client = user_data;
 	int client_sk = g_io_channel_unix_get_fd(channel);
+	int len;
+	struct sockaddr_in6 client_addr6;
+	socklen_t client_addr6_len = sizeof(client_addr6);
+	struct sockaddr_in client_addr4;
+	socklen_t client_addr4_len = sizeof(client_addr4);
+	void *client_addr;
+	socklen_t *client_addr_len;
 
 	if (condition & (G_IO_NVAL | G_IO_ERR | G_IO_HUP)) {
 		g_hash_table_remove(partial_tcp_req_table,
@@ -3409,13 +3446,6 @@ static gboolean tcp_client_event(GIOChannel *channel, GIOCondition condition,
 		connman_error("Error with TCP client %d channel", client_sk);
 		return FALSE;
 	}
-
-	struct sockaddr_in6 client_addr6;
-	socklen_t client_addr6_len = sizeof(client_addr6);
-	struct sockaddr_in client_addr4;
-	socklen_t client_addr4_len = sizeof(client_addr4);
-	void *client_addr;
-	socklen_t *client_addr_len;
 
 	switch (client->family) {
 	case AF_INET:
@@ -3433,8 +3463,8 @@ static gboolean tcp_client_event(GIOChannel *channel, GIOCondition condition,
 		return FALSE;
 	}
 
-	const int len = recvfrom(client_sk, client->buf + client->buf_end,
-			TCP_MAX_BUF_LEN - client->buf_end, 0,
+	len = recvfrom(client_sk, client->buf + client->buf_end,
+			TCP_MAX_BUF_LEN - client->buf_end - 1, 0,
 			client_addr, client_addr_len);
 	if (len < 0) {
 		if (errno == EAGAIN || errno == EWOULDBLOCK)
@@ -3446,6 +3476,8 @@ static gboolean tcp_client_event(GIOChannel *channel, GIOCondition condition,
 					GINT_TO_POINTER(client_sk));
 		return FALSE;
 	}
+
+	client->buf[client->buf_end + len] = '\0';
 
 	return read_tcp_data(client, client_addr, *client_addr_len, len);
 }
@@ -3633,7 +3665,7 @@ static bool udp_listener_event(GIOChannel *channel, GIOCondition condition,
 				struct listener_data *ifdata, int family,
 				guint *listener_watch)
 {
-	unsigned char buf[768];
+	unsigned char buf[769];
 	char query[512];
 	struct request_data *req = NULL;
 	struct domain_hdr *hdr = NULL;
@@ -3662,9 +3694,11 @@ static bool udp_listener_event(GIOChannel *channel, GIOCondition condition,
 
 	memset(client_addr, 0, *client_addr_len);
 	sk = g_io_channel_unix_get_fd(channel);
-	len = recvfrom(sk, buf, sizeof(buf), 0, client_addr, client_addr_len);
+	len = recvfrom(sk, buf, sizeof(buf) - 1, 0, client_addr, client_addr_len);
 	if (len < 2)
 		return true;
+
+	buf[len] = '\0';
 
 	debug("Received %d bytes (id 0x%04x)", len, buf[0] | buf[1] << 8);
 
@@ -3818,7 +3852,12 @@ static GIOChannel *get_listener(int family, int protocol, int index)
 			return NULL;
 		}
 
-		fcntl(sk, F_SETFL, O_NONBLOCK);
+		if (fcntl(sk, F_SETFL, O_NONBLOCK) < 0) {
+			connman_error("Failed to set TCP listener socket to non-blocking %d/%s",
+				-errno, strerror(errno));
+			close(sk);
+			return NULL;
+		}
 	}
 
 	channel = g_io_channel_unix_new(sk);
@@ -3924,7 +3963,9 @@ static void destroy_tcp_listener(struct listener_data *ifdata)
 
 static int create_listener(struct listener_data *ifdata)
 {
-	int err = create_dns_listener(IPPROTO_UDP, ifdata);
+	int index, err;
+
+	err = create_dns_listener(IPPROTO_UDP, ifdata);
 	if ((err & UDP_FAILED) == UDP_FAILED)
 		return -EIO;
 
@@ -3934,7 +3975,7 @@ static int create_listener(struct listener_data *ifdata)
 		return -EIO;
 	}
 
-	int index = connman_inet_ifindex("lo");
+	index = connman_inet_ifindex("lo");
 	if (ifdata->index == index) {
 		if ((err & IPv6_FAILED) != IPv6_FAILED)
 			__connman_resolvfile_append(index, NULL, "::1");

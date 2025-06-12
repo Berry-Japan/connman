@@ -87,7 +87,6 @@ struct connman_network {
 		void *ssid;
 		int ssid_len;
 		char *mode;
-		unsigned short channel;
 		char *security;
 		char *passphrase;
 		char *eap;
@@ -1023,7 +1022,7 @@ static void set_disconnected(struct connman_network *network)
 					CONNMAN_IPCONFIG_TYPE_IPV6);
 
 	if (network->connected) {
-		__connman_connection_gateway_remove(service,
+		__connman_gateway_remove(service,
 						CONNMAN_IPCONFIG_TYPE_ALL);
 
 		__connman_ipconfig_address_unset(ipconfig_ipv4);
@@ -1334,7 +1333,7 @@ void connman_network_unref_debug(struct connman_network *network,
 	network_destruct(network);
 }
 
-const char *__connman_network_get_type(struct connman_network *network)
+const char *__connman_network_get_type(const struct connman_network *network)
 {
 	return type2string(network->type);
 }
@@ -1346,7 +1345,7 @@ const char *__connman_network_get_type(struct connman_network *network)
  * Get type of network
  */
 enum connman_network_type connman_network_get_type(
-				struct connman_network *network)
+				const struct connman_network *network)
 {
 	return network->type;
 }
@@ -1357,7 +1356,7 @@ enum connman_network_type connman_network_get_type(
  *
  * Get identifier of network
  */
-const char *connman_network_get_identifier(struct connman_network *network)
+const char *connman_network_get_identifier(const struct connman_network *network)
 {
 	return network->identifier;
 }
@@ -1404,7 +1403,7 @@ done:
  *
  * Get index number of network
  */
-int connman_network_get_index(struct connman_network *network)
+int connman_network_get_index(const struct connman_network *network)
 {
 	return network->index;
 }
@@ -2119,14 +2118,6 @@ uint16_t connman_network_get_frequency(struct connman_network *network)
 	return network->frequency;
 }
 
-int connman_network_set_wifi_channel(struct connman_network *network,
-						uint16_t channel)
-{
-	network->wifi.channel = channel;
-
-	return 0;
-}
-
 int connman_network_set_autoconnect(struct connman_network *network,
 				bool autoconnect)
 {
@@ -2140,11 +2131,6 @@ bool __connman_network_native_autoconnect(struct connman_network *network)
 	if (!network->driver || !network->driver->set_autoconnect)
 		return false;
 	return true;
-}
-
-uint16_t connman_network_get_wifi_channel(struct connman_network *network)
-{
-	return network->wifi.channel;
 }
 
 /**

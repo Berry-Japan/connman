@@ -81,11 +81,11 @@ connman_network_ref_debug(struct connman_network *network,
 void connman_network_unref_debug(struct connman_network *network,
 			const char *file, int line, const char *caller);
 
-enum connman_network_type connman_network_get_type(struct connman_network *network);
-const char *connman_network_get_identifier(struct connman_network *network);
+enum connman_network_type connman_network_get_type(const struct connman_network *network);
+const char *connman_network_get_identifier(const struct connman_network *network);
 
 void connman_network_set_index(struct connman_network *network, int index);
-int connman_network_get_index(struct connman_network *network);
+int connman_network_get_index(const struct connman_network *network);
 
 void connman_network_set_group(struct connman_network *network,
 						const char *group);
@@ -129,9 +129,6 @@ uint8_t connman_network_get_strength(struct connman_network *network);
 int connman_network_set_frequency(struct connman_network *network,
 					uint16_t frequency);
 uint16_t connman_network_get_frequency(struct connman_network *network);
-int connman_network_set_wifi_channel(struct connman_network *network,
-					uint16_t channel);
-uint16_t connman_network_get_wifi_channel(struct connman_network *network);
 int connman_network_set_autoconnect(struct connman_network *network,
 				bool autoconnect);
 

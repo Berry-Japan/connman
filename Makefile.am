@@ -117,7 +117,7 @@ src_connmand_SOURCES = $(gdhcp_sources) $(gweb_sources) $(stats_sources) \
 			$(backtrace_sources) $(builtin_sources) $(shared_sources) \
 			src/connman.ver src/main.c src/connman.h src/log.c \
 			src/error.c src/plugin.c src/task.c \
-			src/device.c src/network.c src/connection.c \
+			src/device.c src/network.c src/gateway.c \
 			src/manager.c src/service.c \
 			src/clock.c src/timezone.c src/agent-connman.c \
 			src/agent.c src/notifier.c src/provider.c \
@@ -140,7 +140,7 @@ src_connmand_SOURCES += src/dns-systemd-resolved.c
 endif
 
 src_connmand_LDADD = gdbus/libgdbus-internal.la $(builtin_libadd) \
-			@GLIB_LIBS@ @DBUS_LIBS@ @GNUTLS_LIBS@ \
+			@GIO_LIBS@ @GLIB_LIBS@ @DBUS_LIBS@ @GNUTLS_LIBS@ \
 			-lresolv -ldl -lrt
 
 src_connmand_LDFLAGS = -Wl,--export-dynamic \
@@ -184,7 +184,7 @@ vpn_connman_vpnd_SOURCES = $(builtin_vpn_sources) $(backtrace_sources) \
 			vpn/vpn-config.c vpn/vpn-settings.c vpn/vpn-util.c
 
 vpn_connman_vpnd_LDADD = gdbus/libgdbus-internal.la $(builtin_vpn_libadd) \
-				@GLIB_LIBS@ @DBUS_LIBS@ @GNUTLS_LIBS@ \
+				@GIO_LIBS@ @GLIB_LIBS@ @DBUS_LIBS@ @GNUTLS_LIBS@ \
 				-lresolv -ldl
 
 vpn_connman_vpnd_LDFLAGS = -Wl,--export-dynamic \
@@ -324,21 +324,23 @@ unit_test_ippool_SOURCES = $(backtrace_sources) src/log.c src/dbus.c \
 unit_test_ippool_LDADD = gdbus/libgdbus-internal.la \
 				@GLIB_LIBS@ @DBUS_LIBS@ -ldl
 
+LOG_DRIVER = env AM_TAP_AWK='$(AWK)' $(SHELL) \
+			$(top_srcdir)/tap-driver.sh
+
 TESTS = unit/test-ippool
 
 if WISPR
 noinst_PROGRAMS += tools/wispr
 
 tools_wispr_SOURCES = $(gweb_sources) tools/wispr.c
-tools_wispr_LDADD = @GLIB_LIBS@ @GNUTLS_LIBS@ -lresolv
+tools_wispr_LDADD = @GIO_LIBS@ @GLIB_LIBS@ @GNUTLS_LIBS@ -lresolv
 endif
 
 if TOOLS
 noinst_PROGRAMS += tools/supplicant-test \
 			tools/dhcp-test tools/dhcp-server-test \
 			tools/addr-test tools/web-test tools/resolv-test \
-			tools/dbus-test tools/polkit-test \
-			tools/tap-test tools/wpad-test \
+			tools/dbus-test tools/polkit-test tools/wpad-test \
 			tools/stats-tool tools/private-network-test \
 			tools/session-test \
 			tools/dnsproxy-test
@@ -350,7 +352,7 @@ tools_supplicant_test_LDADD = gdbus/libgdbus-internal.la \
 				@GLIB_LIBS@ @DBUS_LIBS@
 
 tools_web_test_SOURCES = $(gweb_sources) tools/web-test.c
-tools_web_test_LDADD = @GLIB_LIBS@ @GNUTLS_LIBS@ -lresolv
+tools_web_test_LDADD = @GIO_LIBS@ @GLIB_LIBS@ @GNUTLS_LIBS@ -lresolv
 
 tools_resolv_test_SOURCES = gweb/gresolv.h gweb/gresolv.c tools/resolv-test.c
 tools_resolv_test_LDADD = @GLIB_LIBS@ -lresolv
@@ -412,7 +414,7 @@ unit_test_iptables_LDADD = @GLIB_LIBS@ -ldl
 endif
 
 tools_dnsproxy_test_SOURCES = tools/dnsproxy-test.c
-tools_dnsproxy_test_LDADD = @GLIB_LIBS@
+tools_dnsproxy_test_LDADD = @GIO_LIBS@ @GLIB_LIBS@
 
 endif
 
@@ -502,7 +504,7 @@ DISTCHECK_CONFIGURE_FLAGS = --disable-datafiles \
 DISTCLEANFILES = $(pkgconfig_DATA)
 
 MAINTAINERCLEANFILES = Makefile.in \
-	aclocal.m4 configure config.h.in config.sub config.guess \
+	aclocal.m4 configure config.h.in config.sub config.guess tap-driver.sh \
 	ltmain.sh depcomp compile missing install-sh mkinstalldirs test-driver
 
 
@@ -542,6 +544,8 @@ connman-task.pp: vpn/connman-task.te
 endif
 
 EXTRA_DIST += vpn/connman-task.te
+
+EXTRA_DIST += scripts/libppp-compat.h
 
 do_subst = $(AM_V_GEN)$(SED) \
 		-e 's,[@]prefix[@],$(prefix),g' \
